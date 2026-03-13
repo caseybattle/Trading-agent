@@ -30,7 +30,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ─── Config ─────────────────────────────────────────────────────────────────────
+# --- Config ---------------------------------------------------------------------
 BASE_URL   = "https://api.elections.kalshi.com/trade-api/v2"
 DATA_DIR   = Path(__file__).parent.parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -50,7 +50,7 @@ CATEGORY_MAP = {
 }
 
 
-# ─── Auth ────────────────────────────────────────────────────────────────────────
+# --- Auth ------------------------------------------------------------------------
 
 def _load_private_key():
     """Load the RSA private key from the PEM file at KALSHI_PRIVATE_KEY_PATH."""
@@ -66,9 +66,9 @@ def _kalshi_headers(method: str, path: str) -> dict:
     Build Kalshi RSA auth headers for a single request.
 
     Headers required:
-      KALSHI-ACCESS-KEY       — API Key ID from env KALSHI_API_KEY_ID
-      KALSHI-ACCESS-TIMESTAMP — current time in milliseconds as a string
-      KALSHI-ACCESS-SIGNATURE — base64(RSA-PKCS1v15-SHA256(ts + METHOD + path))
+      KALSHI-ACCESS-KEY       -- API Key ID from env KALSHI_API_KEY_ID
+      KALSHI-ACCESS-TIMESTAMP -- current time in milliseconds as a string
+      KALSHI-ACCESS-SIGNATURE -- base64(RSA-PKCS1v15-SHA256(ts + METHOD + path))
     """
     key_id      = os.environ.get("KALSHI_API_KEY_ID", "")
     private_key = _load_private_key()
@@ -83,7 +83,7 @@ def _kalshi_headers(method: str, path: str) -> dict:
         sig = private_key.sign(msg, padding.PKCS1v15(), hashes.SHA256())
         headers["KALSHI-ACCESS-SIGNATURE"] = base64.b64encode(sig).decode("utf-8")
     else:
-        print("[!] KALSHI_API_KEY_ID or KALSHI_PRIVATE_KEY_PATH not set — unauthenticated.")
+        print("[!] KALSHI_API_KEY_ID or KALSHI_PRIVATE_KEY_PATH not set -- unauthenticated.")
     return headers
 
 
@@ -94,7 +94,7 @@ def get_session() -> requests.Session:
     return session
 
 
-# ─── Utility ─────────────────────────────────────────────────────────────────────
+# --- Utility ---------------------------------------------------------------------
 
 def infer_category(title: str) -> str:
     t = title.lower()
@@ -122,7 +122,7 @@ def parse_date(s: Optional[str]) -> Optional[datetime]:
     return None
 
 
-# ─── Kalshi API Fetchers ─────────────────────────────────────────────────────────
+# --- Kalshi API Fetchers ---------------------------------------------------------
 
 def fetch_settled_markets(session: requests.Session, limit: int = 100,
                           cursor: Optional[str] = None,
@@ -143,7 +143,7 @@ def fetch_settled_markets(session: requests.Session, limit: int = 100,
         timeout=30,
     )
     if resp.status_code == 401:
-        print("[!] Kalshi auth failed — check KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY_PATH")
+        print("[!] Kalshi auth failed -- check KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY_PATH")
         return [], None
     resp.raise_for_status()
 
@@ -187,10 +187,10 @@ def fetch_market_history(session: requests.Session, ticker: str) -> pd.DataFrame
     return pd.DataFrame()
 
 
-# ─── Feature Engineering ─────────────────────────────────────────────────────────
+# --- Feature Engineering ---------------------------------------------------------
 
 def engineer_features(market: dict, price_history: pd.DataFrame) -> dict:
-    """Compute features for a single Kalshi market — same schema as Polymarket."""
+    """Compute features for a single Kalshi market -- same schema as Polymarket."""
     ticker   = market.get("ticker", "")
     title    = market.get("title", "")
     category = infer_category(title)
@@ -202,7 +202,7 @@ def engineer_features(market: dict, price_history: pd.DataFrame) -> dict:
     open_int   = safe_float(market.get("open_interest"))
     liquidity  = safe_float(market.get("liquidity", volume))
 
-    # Kalshi prices are in cents (0–100)
+    # Kalshi prices are in cents (0-100)
     best_ask_raw = safe_float(market.get("yes_ask", market.get("best_ask", 0)))
     best_bid_raw = safe_float(market.get("yes_bid", market.get("best_bid", 0)))
     best_ask = best_ask_raw / 100.0 if best_ask_raw > 1.5 else best_ask_raw
@@ -289,7 +289,7 @@ def add_volume_anomaly_scores(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ─── Main Scraper ─────────────────────────────────────────────────────────────────
+# --- Main Scraper -----------------------------------------------------------------
 
 def scrape_kalshi(days: int = 90, max_markets: int = 10000,
                   fetch_prices: bool = True) -> pd.DataFrame:
@@ -313,7 +313,7 @@ def scrape_kalshi(days: int = 90, max_markets: int = 10000,
             break
 
         if not markets:
-            print(f"  [✓] Done. Total markets collected: {len(raw_markets)}")
+            print(f"  [OK] Done. Total markets collected: {len(raw_markets)}")
             break
 
         # Apply cutoff filter
@@ -329,7 +329,7 @@ def scrape_kalshi(days: int = 90, max_markets: int = 10000,
                 filtered.append(m)
 
         raw_markets.extend(filtered)
-        print(f"  Page {page}: +{len(filtered)} → total {len(raw_markets)}")
+        print(f"  Page {page}: +{len(filtered)} -> total {len(raw_markets)}")
         page += 1
 
         if stop or not cursor:
@@ -362,10 +362,10 @@ def scrape_kalshi(days: int = 90, max_markets: int = 10000,
     df = df[df["outcome_label"].isin([0, 1])].reset_index(drop=True)
     df = add_volume_anomaly_scores(df)
 
-    # ── Save ───────────────────────────────────────────────────────────────────
+    # -- Save -------------------------------------------------------------------
     raw_path = DATA_DIR / "kalshi_resolved.parquet"
     df.to_parquet(raw_path, index=False)
-    print(f"\n[✓] Saved Kalshi resolved → {raw_path} ({len(df)} rows)")
+    print(f"\n[OK] Saved Kalshi resolved -> {raw_path} ({len(df)} rows)")
 
     feat_cols = [
         "market_id", "question", "category", "outcome_label",
@@ -379,9 +379,9 @@ def scrape_kalshi(days: int = 90, max_markets: int = 10000,
     available_cols = [c for c in feat_cols if c in df.columns]
     feat_path = DATA_DIR / "features" / "kalshi_features.parquet"
     df[available_cols].to_parquet(feat_path, index=False)
-    print(f"[✓] Saved Kalshi features → {feat_path}")
+    print(f"[OK] Saved Kalshi features -> {feat_path}")
 
-    # ── Merge with Polymarket features if they exist ───────────────────────────
+    # -- Merge with Polymarket features if they exist ---------------------------
     poly_feat = DATA_DIR / "features" / "market_features.parquet"
     if poly_feat.exists():
         poly_df = pd.read_parquet(poly_feat)
@@ -390,15 +390,15 @@ def scrape_kalshi(days: int = 90, max_markets: int = 10000,
                              ignore_index=True)
         combined_path = DATA_DIR / "features" / "market_features_combined.parquet"
         combined.to_parquet(combined_path, index=False)
-        print(f"[✓] Combined features saved → {combined_path} ({len(combined)} rows)")
+        print(f"[OK] Combined features saved -> {combined_path} ({len(combined)} rows)")
 
-    print("\n── Kalshi Category Distribution ────────────────────────────────")
+    print("\n-- Kalshi Category Distribution --------------------------------")
     print(df.groupby("category")["outcome_label"].agg(count="count", yes_rate="mean")
            .round(3).to_string())
     return df
 
 
-# ─── CLI ──────────────────────────────────────────────────────────────────────────
+# --- CLI --------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Scrape Kalshi settled markets")
