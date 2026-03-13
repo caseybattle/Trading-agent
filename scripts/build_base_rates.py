@@ -4,14 +4,20 @@ Computes per-category historical statistics from resolved market data.
 These base rates are used by strategies for superforecasting-level
 probability anchoring (Kahneman's "outside view").
 
+Also backfills CLOB price features (price_at_T1d, price_at_T7d,
+price_momentum_24h, price_volatility_7d) from the Polymarket CLOB API
+using yes_token_id stored in polymarket_resolved.parquet.
+
 Usage:
     python build_base_rates.py
     python build_base_rates.py --min-samples 20 --verbose
     python build_base_rates.py --source polymarket   # single platform
+    python build_base_rates.py --skip-price-backfill # skip CLOB fetching
 """
 
 import json
 import argparse
+import warnings
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -26,10 +32,199 @@ FEATURE_DIR = DATA_DIR / "features"
 
 COMBINED_PATH  = FEATURE_DIR / "market_features_combined.parquet"
 POLY_PATH      = FEATURE_DIR / "market_features.parquet"
+RAW_POLY_PATH  = DATA_DIR / "polymarket_resolved.parquet"
 KALSHI_PATH    = FEATURE_DIR / "kalshi_features.parquet"
 OUTPUT_PATH    = DATA_DIR / "base_rates.json"
 
 N_RELIABILITY_BUCKETS = 10
+
+
+# --- CLOB Price Backfill -----------------------------------------------------
+
+def backfill_price_features(verbose: bool = False) -> bool:
+    """
+    Populate price_at_T1d, price_at_T7d, price_momentum_24h, price_volatility_7d
+    in the features parquet using the Polymarket CLOB prices-history API.
+
+    Strategy:
+    1. Read yes_token_id from polymarket_resolved.parquet (stored by collect_polymarket.py).
+       If that column is absent, fall back to looking up clobTokenIds from the Gamma API.
+    2. For each market whose price features are still null/zero, call the CLOB API to
+       fetch price windows at T-1d and T-7d.
+    3. Re-save both polymarket_resolved.parquet and market_features.parquet with filled values.
+
+    Returns True if any prices were successfully fetched, False otherwise.
+    """
+    # Import the helpers from collect_polymarket.py (sibling script)
+    import sys, time, importlib
+    scripts_dir = Path(__file__).parent
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+
+    try:
+        import collect_polymarket as cp
+    except ImportError as e:
+        print(f"[!] Cannot import collect_polymarket: {e}")
+        return False
+
+    # ── Load raw parquet (has yes_token_id column if collected after this patch) ─
+    if not RAW_POLY_PATH.exists():
+        print(f"[!] Raw parquet not found: {RAW_POLY_PATH}  — run collect_polymarket.py first.")
+        return False
+
+    raw = pd.read_parquet(RAW_POLY_PATH)
+
+    # ── Determine which markets need price backfill ───────────────────────────
+    # A market needs backfill if price_at_T1d is still null
+    needs_backfill_mask = raw["price_at_T1d"].isna()
+    needs_backfill = raw[needs_backfill_mask].copy()
+    total_needed = len(needs_backfill)
+
+    if total_needed == 0:
+        print("[price backfill] All markets already have price_at_T1d. Skipping.")
+        return True
+
+    print(f"[price backfill] {total_needed} markets need price feature population ...")
+
+    # ── Ensure yes_token_id column exists ─────────────────────────────────────
+    if "yes_token_id" not in raw.columns:
+        print("[price backfill] yes_token_id column missing from raw parquet.")
+        print("                 Attempting live Gamma API lookup for token IDs ...")
+        raw["yes_token_id"] = None
+
+    # ── Fetch token IDs for any rows missing them (old-format parquet) ────────
+    missing_token_mask = raw["yes_token_id"].isna() | (raw["yes_token_id"] == "")
+    if missing_token_mask.any():
+        n_missing = missing_token_mask.sum()
+        print(f"[price backfill] Fetching clobTokenIds for {n_missing} markets via Gamma API ...")
+        import requests as _req, json as _json
+        _session = _req.Session()
+        _session.headers.update({"User-Agent": "prediction-market-bot/1.0"})
+
+        for idx in raw.index[missing_token_mask]:
+            mid = raw.at[idx, "market_id"]
+            try:
+                r = _session.get(
+                    f"https://gamma-api.polymarket.com/markets/{mid}",
+                    timeout=15,
+                )
+                if r.status_code == 200:
+                    m = r.json()
+                    ctids = m.get("clobTokenIds", [])
+                    if isinstance(ctids, str):
+                        ctids = _json.loads(ctids)
+                    if ctids:
+                        raw.at[idx, "yes_token_id"] = str(ctids[0])
+            except Exception as exc:
+                if verbose:
+                    print(f"    [warn] market {mid}: Gamma lookup failed: {exc}")
+            time.sleep(0.4)   # polite rate limit
+
+        # Save updated token IDs back to raw parquet
+        raw.to_parquet(RAW_POLY_PATH, index=False)
+        print(f"[price backfill] Token IDs saved to {RAW_POLY_PATH}")
+
+    # Reload needs_backfill with updated token IDs
+    needs_backfill = raw[raw["price_at_T1d"].isna()].copy()
+
+    # ── Pre-load the price cache ───────────────────────────────────────────────
+    cp._load_price_cache()
+
+    filled_count = 0
+    total = len(needs_backfill)
+
+    for i, (idx, row) in enumerate(needs_backfill.iterrows()):
+        token_id = row.get("yes_token_id")
+        end_date = row.get("end_date")
+
+        if not token_id or not end_date or str(token_id) in ("None", "nan", ""):
+            if verbose:
+                print(f"  [skip] market {row.get('market_id')}: no token_id")
+            continue
+
+        token_id = str(token_id)
+
+        # ── T-1d price ─────────────────────────────────────────────────────
+        p1d = cp.fetch_price_at_offset(token_id, end_date, offset_days=1)
+        time.sleep(0.5)
+
+        # ── 7-day price window (for T-7d price AND volatility) ─────────────
+        ph7 = cp.fetch_price_window(token_id, end_date, lookback_days=8)
+        time.sleep(0.5)
+
+        p7d        = None
+        vol_7d     = 0.0
+        momentum   = 0.0
+
+        if not ph7.empty and len(ph7) >= 2:
+            from datetime import datetime, timedelta, timezone as _tz
+            end_dt = None
+            if isinstance(end_date, str):
+                for fmt in ("%Y-%m-%d %H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ",
+                            "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%d"):
+                    try:
+                        end_dt = datetime.strptime(end_date, fmt)
+                        break
+                    except ValueError:
+                        continue
+                if end_dt and end_dt.tzinfo is None:
+                    end_dt = end_dt.replace(tzinfo=_tz.utc)
+            elif isinstance(end_date, datetime):
+                end_dt = end_date
+
+            if end_dt:
+                target_7d = end_dt - timedelta(days=7)
+                # Pick point closest to T-7d
+                ph7["dt_diff"] = (ph7["timestamp"] - target_7d).abs()
+                p7d = float(ph7.loc[ph7["dt_diff"].idxmin(), "price"])
+
+            # Volatility = std of all prices in the 7-day window
+            ph_7d_window = ph7[ph7["timestamp"] >= (ph7["timestamp"].max() - pd.Timedelta(days=7))]
+            if len(ph_7d_window) >= 2:
+                vol_7d = float(ph_7d_window["price"].std())
+
+            # Momentum = T-1d price minus T-7d price (approximate)
+            if p1d is not None and p7d is not None:
+                momentum = p1d - p7d
+
+        # ── Write back into raw DataFrame ─────────────────────────────────
+        if p1d is not None or p7d is not None:
+            raw.at[idx, "price_at_T1d"]        = p1d
+            raw.at[idx, "price_at_T7d"]         = p7d
+            raw.at[idx, "price_momentum_24h"]   = momentum
+            raw.at[idx, "price_volatility_7d"]  = vol_7d
+            filled_count += 1
+
+        if verbose or (i + 1) % 50 == 0:
+            pct = (i + 1) / total * 100
+            print(f"  [{i+1:4d}/{total}] {pct:5.1f}%  market={row.get('market_id')}  "
+                  f"T1d={p1d}  T7d={p7d}  filled_so_far={filled_count}")
+
+    print(f"\n[price backfill] Filled {filled_count}/{total} markets with price features.")
+
+    # ── Flush CLOB price cache to disk ────────────────────────────────────────
+    cp._flush_price_cache()
+
+    # ── Save updated raw parquet ──────────────────────────────────────────────
+    raw.to_parquet(RAW_POLY_PATH, index=False)
+
+    # ── Re-save features parquet with updated price columns ───────────────────
+    if POLY_PATH.exists():
+        feat = pd.read_parquet(POLY_PATH)
+        # Merge updated price columns from raw into features (join on market_id)
+        price_cols = ["market_id", "price_at_T1d", "price_at_T7d",
+                      "price_momentum_24h", "price_volatility_7d"]
+        updates = raw[price_cols].drop_duplicates("market_id")
+        # Drop old price cols from feat and merge in updated ones
+        for col in ["price_at_T1d", "price_at_T7d",
+                    "price_momentum_24h", "price_volatility_7d"]:
+            if col in feat.columns:
+                feat = feat.drop(columns=[col])
+        feat = feat.merge(updates, on="market_id", how="left")
+        feat.to_parquet(POLY_PATH, index=False)
+        print(f"[price backfill] Updated features parquet -> {POLY_PATH}")
+
+    return filled_count > 0
 
 
 # --- Data Loading -------------------------------------------------------------
@@ -326,7 +521,8 @@ def compute_global_stats(df: pd.DataFrame) -> dict:
 # --- Main ---------------------------------------------------------------------
 
 def build_base_rates(min_samples: int = 20, source: Optional[str] = None,
-                     verbose: bool = False) -> dict:
+                     verbose: bool = False,
+                     skip_price_backfill: bool = False) -> dict:
     """
     Build the complete base rate database from resolved prediction market data.
 
@@ -334,6 +530,7 @@ def build_base_rates(min_samples: int = 20, source: Optional[str] = None,
         min_samples: Minimum markets per category to include in output
         source: 'polymarket', 'kalshi', or None (all available)
         verbose: Print per-category diagnostics
+        skip_price_backfill: If True, skip the CLOB API price feature population step
     Returns:
         Full base rates dictionary (also written to data/base_rates.json)
     """
@@ -341,7 +538,19 @@ def build_base_rates(min_samples: int = 20, source: Optional[str] = None,
     print("BASE RATE EXTRACTOR -- Prediction Markets")
     print("=" * 65)
 
-    # Load data
+    # Backfill CLOB price features (price_at_T1d, T7d, momentum, volatility)
+    # Must run before load_features() so the features parquet is up to date.
+    if not skip_price_backfill and (source is None or source == "polymarket"):
+        print("\n-- CLOB price feature backfill ----------------------------------")
+        if RAW_POLY_PATH.exists():
+            backfill_price_features(verbose=verbose)
+        else:
+            print(f"  [skip] Raw parquet not found: {RAW_POLY_PATH}")
+            print("         Run collect_polymarket.py first to enable price backfill.")
+    elif skip_price_backfill:
+        print("\n  [--skip-price-backfill] Skipping CLOB price feature population.")
+
+    # Load data (reload after backfill so updated prices are included)
     df = load_features(source)
     print(f"\n[[ok]] Loaded {len(df)} markets with valid outcomes (0/1)\n")
 
@@ -457,12 +666,17 @@ if __name__ == "__main__":
         "--verbose", action="store_true",
         help="Print extra diagnostics during computation"
     )
+    parser.add_argument(
+        "--skip-price-backfill", action="store_true",
+        help="Skip CLOB API price feature population (use existing values in parquet)"
+    )
     args = parser.parse_args()
 
     result = build_base_rates(
         min_samples=args.min_samples,
         source=args.source,
         verbose=args.verbose,
+        skip_price_backfill=args.skip_price_backfill,
     )
 
     print(f"\nFinal base rates: {len(result.get('categories', {}))} categories written to {OUTPUT_PATH}")

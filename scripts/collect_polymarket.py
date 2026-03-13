@@ -21,10 +21,14 @@ from pathlib import Path
 from typing import Optional
 
 # ─── Config ────────────────────────────────────────────────────────────────────
-BASE_URL = "https://gamma-api.polymarket.com"
-DATA_DIR = Path(__file__).parent.parent / "data"
+BASE_URL  = "https://gamma-api.polymarket.com"
+CLOB_URL  = "https://clob.polymarket.com"
+DATA_DIR  = Path(__file__).parent.parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 (DATA_DIR / "features").mkdir(exist_ok=True)
+
+# Price history cache — avoids re-fetching on reruns
+PRICE_CACHE_PATH = DATA_DIR / "price_cache.parquet"
 
 CATEGORY_MAP = {
     "politics": ["election", "president", "senate", "congress", "vote", "governor", "mayor",
@@ -171,7 +175,7 @@ def find_start_offset(cutoff_date: datetime,
 
 
 def fetch_price_history(market_id: str, resolution: int = 3600) -> pd.DataFrame:
-    """Fetch hourly CLOB price history for a specific market."""
+    """Fetch hourly CLOB price history for a specific market (legacy — kept for compat)."""
     params = {"market": market_id, "resolution": resolution, "period": "max"}
     try:
         resp = SESSION.get(f"{BASE_URL}/prices-history", params=params, timeout=20)
@@ -188,10 +192,199 @@ def fetch_price_history(market_id: str, resolution: int = 3600) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+# ─── CLOB Price History Helpers ─────────────────────────────────────────────────
+
+_price_cache: dict = {}   # in-memory cache: (token_id, offset_days) -> float|None
+_cache_dirty: bool = False
+
+
+def _load_price_cache() -> None:
+    """Load persisted price cache from parquet on first use."""
+    global _price_cache
+    if _price_cache or not PRICE_CACHE_PATH.exists():
+        return
+    try:
+        df = pd.read_parquet(PRICE_CACHE_PATH)
+        for _, row in df.iterrows():
+            key = (str(row["token_id"]), int(row["offset_days"]))
+            _price_cache[key] = row["price"] if pd.notna(row["price"]) else None
+    except Exception:
+        pass
+
+
+def _flush_price_cache() -> None:
+    """Persist the in-memory price cache to parquet."""
+    global _cache_dirty
+    if not _cache_dirty or not _price_cache:
+        return
+    rows = [
+        {"token_id": k[0], "offset_days": k[1], "price": v}
+        for k, v in _price_cache.items()
+    ]
+    pd.DataFrame(rows).to_parquet(PRICE_CACHE_PATH, index=False)
+    _cache_dirty = False
+
+
+def fetch_price_at_offset(token_id: str, end_date, offset_days: int) -> Optional[float]:
+    """
+    Fetch the YES-token price at exactly `offset_days` before resolution.
+
+    Uses the Polymarket CLOB prices-history API:
+        GET https://clob.polymarket.com/prices-history
+        ?market=<token_id>&startTs=<ts>&endTs=<ts>&fidelity=<n>
+
+    Caches results in data/price_cache.parquet to avoid repeat fetches.
+
+    Args:
+        token_id:    CLOB YES-token ID (the 77-digit number from clobTokenIds[0]).
+        end_date:    Market resolution datetime (UTC-aware or naive string/datetime).
+        offset_days: Days before resolution to target (1 = T-1d, 7 = T-7d).
+
+    Returns:
+        Price (0.0–1.0) closest to target timestamp, or None if no data.
+    """
+    global _cache_dirty
+
+    _load_price_cache()
+    cache_key = (str(token_id), int(offset_days))
+
+    # Return cached result (including cached None so we don't re-fetch failures)
+    if cache_key in _price_cache:
+        return _price_cache[cache_key]
+
+    # Normalise end_date to UTC datetime
+    if isinstance(end_date, str):
+        end_dt = None
+        for fmt in ("%Y-%m-%d %H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ",
+                    "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%d"):
+            try:
+                end_dt = datetime.strptime(end_date, fmt)
+                break
+            except ValueError:
+                continue
+        if end_dt is None:
+            _price_cache[cache_key] = None
+            return None
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+    elif isinstance(end_date, datetime):
+        end_dt = end_date if end_date.tzinfo else end_date.replace(tzinfo=timezone.utc)
+    else:
+        _price_cache[cache_key] = None
+        return None
+
+    # Target timestamp and window around it
+    target_dt  = end_dt - timedelta(days=offset_days)
+    window_sec = 43200  # ±12 h window for hourly fidelity
+    start_ts   = int((target_dt - timedelta(seconds=window_sec)).timestamp())
+    end_ts     = int((target_dt + timedelta(seconds=window_sec)).timestamp())
+
+    try:
+        resp = SESSION.get(
+            f"{CLOB_URL}/prices-history",
+            params={
+                "market":   token_id,
+                "startTs":  start_ts,
+                "endTs":    end_ts,
+                "fidelity": 100,
+            },
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            _price_cache[cache_key] = None
+            _cache_dirty = True
+            return None
+
+        history = resp.json().get("history", [])
+        if not history:
+            _price_cache[cache_key] = None
+            _cache_dirty = True
+            return None
+
+        # Find the point closest to target_ts
+        target_ts = int(target_dt.timestamp())
+        closest = min(history, key=lambda p: abs(p["t"] - target_ts))
+        price = float(closest["p"])
+
+        _price_cache[cache_key] = price
+        _cache_dirty = True
+        return price
+
+    except Exception:
+        _price_cache[cache_key] = None
+        _cache_dirty = True
+        return None
+
+
+def fetch_price_window(token_id: str, end_date,
+                       lookback_days: int = 8) -> pd.DataFrame:
+    """
+    Fetch a multi-day price window ending at `end_date` from the CLOB API.
+
+    Used to compute price_volatility_7d (std over 7-day window).
+
+    Returns:
+        DataFrame with columns [timestamp (UTC datetime), price (float)].
+        Empty DataFrame if unavailable.
+    """
+    if isinstance(end_date, str):
+        end_dt = None
+        for fmt in ("%Y-%m-%d %H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ",
+                    "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%d"):
+            try:
+                end_dt = datetime.strptime(end_date, fmt)
+                break
+            except ValueError:
+                continue
+        if end_dt is None:
+            return pd.DataFrame()
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+    elif isinstance(end_date, datetime):
+        end_dt = end_date if end_date.tzinfo else end_date.replace(tzinfo=timezone.utc)
+    else:
+        return pd.DataFrame()
+
+    start_ts = int((end_dt - timedelta(days=lookback_days)).timestamp())
+    end_ts   = int(end_dt.timestamp())
+
+    try:
+        resp = SESSION.get(
+            f"{CLOB_URL}/prices-history",
+            params={
+                "market":   token_id,
+                "startTs":  start_ts,
+                "endTs":    end_ts,
+                "fidelity": 200,
+            },
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return pd.DataFrame()
+
+        history = resp.json().get("history", [])
+        if not history:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(history)
+        df["timestamp"] = pd.to_datetime(df["t"], unit="s", utc=True)
+        df["price"]     = df["p"].astype(float)
+        return df[["timestamp", "price"]].sort_values("timestamp").reset_index(drop=True)
+
+    except Exception:
+        return pd.DataFrame()
+
+
 # ─── Feature Engineering ────────────────────────────────────────────────────────
 
 def engineer_features(market: dict, price_history: pd.DataFrame) -> dict:
-    """Compute all features for a single market snapshot."""
+    """Compute all features for a single market snapshot.
+
+    Price features (price_at_T1d, price_at_T7d, price_momentum_24h,
+    price_volatility_7d) are populated either from the supplied price_history
+    DataFrame (legacy path) or left as None/0.0 to be backfilled by
+    build_base_rates.py using the CLOB API + clobTokenIds.
+    """
     question = market.get("question", "")
     category = infer_category(question)
 
@@ -249,6 +442,15 @@ def engineer_features(market: dict, price_history: pd.DataFrame) -> dict:
                 if not ph_1d.empty:
                     price_at_T1d = ph_1d["price"].iloc[-1]
 
+    # Extract YES token ID from clobTokenIds (index 0 = YES by convention)
+    clob_token_ids = market.get("clobTokenIds", [])
+    if isinstance(clob_token_ids, str):
+        try:
+            clob_token_ids = json.loads(clob_token_ids)
+        except Exception:
+            clob_token_ids = []
+    yes_token_id = str(clob_token_ids[0]) if clob_token_ids else None
+
     # Volume anomaly score will be computed cross-market; set placeholder
     volume_anomaly_score = 0.0
 
@@ -274,11 +476,13 @@ def engineer_features(market: dict, price_history: pd.DataFrame) -> dict:
         "end_date":              str(end_dt) if end_dt else None,
         "time_to_resolution_hours": resolution_hours,
         "days_since_market_open": days_since_open,
-        # Price dynamics
+        # Price dynamics (populated by CLOB API in build_base_rates backfill step)
         "price_momentum_24h":    price_momentum_24h,
         "price_volatility_7d":   price_volatility_7d,
         "price_at_T7d":          price_at_T7d,
         "price_at_T1d":          price_at_T1d,
+        # CLOB token ID for price-history backfill (not in feature set, stored in raw parquet)
+        "yes_token_id":          yes_token_id,
         # Volume anomaly (to fill in cross-market pass)
         "volume_anomaly_score":  volume_anomaly_score,
     }
@@ -390,7 +594,7 @@ def _process_markets(raw_markets: list, fetch_prices: bool) -> pd.DataFrame:
     # Cross-market volume anomaly scoring
     df = add_volume_anomaly_scores(df)
 
-    # ── Save raw resolved parquet ──────────────────────────────────────────────
+    # ── Save raw resolved parquet (includes yes_token_id for price backfill) ──
     raw_path = DATA_DIR / "polymarket_resolved.parquet"
     df.to_parquet(raw_path, index=False)
     print(f"\n[saved] Raw resolved markets -> {raw_path} ({len(df)} rows)")
@@ -408,6 +612,9 @@ def _process_markets(raw_markets: list, fetch_prices: bool) -> pd.DataFrame:
     feat_path = DATA_DIR / "features" / "market_features.parquet"
     df[feature_cols].to_parquet(feat_path, index=False)
     print(f"[saved] Engineered features -> {feat_path}")
+
+    # Flush any price cache entries written during this session
+    _flush_price_cache()
 
     # ── Category summary ───────────────────────────────────────────────────────
     print("\n-- Category Distribution ------------------------------------------")
