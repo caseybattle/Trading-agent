@@ -48,7 +48,7 @@ NUMERIC_FEATURES = [
     "days_since_market_open",
     "prior_resolution_rate",
 ]
-LABEL_COL = "outcome"
+LABEL_COL = "outcome_label"
 DATE_COL = "end_date"
 
 # Holdout: last 20% by date — NEVER used in training
@@ -452,6 +452,10 @@ def run_full_backtest(
     if DATE_COL not in df.columns:
         raise ValueError(f"Missing '{DATE_COL}' column — needed for holdout split")
 
+    # Ensure date column is datetime (may be stored as strings in parquet)
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL], utc=True, errors="coerce")
+    df = df.dropna(subset=[DATE_COL])
+
     df = df.sort_values(DATE_COL).reset_index(drop=True)
     cutoff = df[DATE_COL].quantile(HOLDOUT_QUANTILE)
     train_df = df[df[DATE_COL] <= cutoff].copy()
@@ -601,9 +605,18 @@ def save_report(report: BacktestReport, out_dir: Path = BACKTEST_DIR) -> None:
         },
     }
 
+    def _json_default(obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
     summary_path = out_dir / "backtest_summary.json"
     with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
+        json.dump(summary, f, indent=2, default=_json_default)
     log.info(f"Saved backtest summary to {summary_path}")
 
     print("\n=== BACKTEST SUMMARY ===")
