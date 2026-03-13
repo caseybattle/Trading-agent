@@ -325,14 +325,25 @@ def tab_calibration() -> None:
         st.info("No calibration history yet. Data will appear after live trading starts.")
 
     # Calibration curve from features
+    # Use price_at_T1d as predicted probability (written by collect_polymarket.py);
+    # fall back to price_at_T7d if T1d is absent.
     features_df = load_features()
-    if not features_df.empty and "outcome_label" in features_df.columns and "prior_resolution_rate" in features_df.columns:
-        st.subheader("Calibration Curve: Prior Resolution Rate vs. Actual Outcome")
+    prob_col: Optional[str] = None
+    if not features_df.empty and "outcome_label" in features_df.columns:
+        for candidate in ("price_at_T1d", "price_at_T7d"):
+            if candidate in features_df.columns:
+                col_valid = features_df[candidate].dropna()
+                if len(col_valid) >= 10:
+                    prob_col = candidate
+                    break
 
-        prob_col = "prior_resolution_rate"
+    if not features_df.empty and "outcome_label" in features_df.columns and prob_col is not None:
+        st.subheader(f"Calibration Curve: {prob_col} vs. Actual Outcome")
+
+        plot_df = features_df[[prob_col, "outcome_label"]].dropna().copy()
         bins = np.linspace(0, 1, 11)
-        features_df["prob_bin"] = pd.cut(features_df[prob_col], bins=bins, labels=False)
-        cal_data = features_df.groupby("prob_bin").agg(
+        plot_df["prob_bin"] = pd.cut(plot_df[prob_col], bins=bins, labels=False)
+        cal_data = plot_df.groupby("prob_bin").agg(
             predicted_mean=(prob_col, "mean"),
             actual_rate=("outcome_label", "mean"),
             count=(prob_col, "count"),
@@ -359,7 +370,7 @@ def tab_calibration() -> None:
             st.dataframe(cal_data, use_container_width=True)
     else:
         _placeholder_chart(
-            "Calibration curve requires features data. Run build_base_rates.py first."
+            "Calibration curve requires features data. Run collect_polymarket.py then build_base_rates.py first."
         )
 
     # Isotonic correction info
