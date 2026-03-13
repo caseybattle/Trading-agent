@@ -70,24 +70,104 @@ def parse_date(date_str: Optional[str]) -> Optional[datetime]:
     return None
 
 
+def resolve_outcome(market: dict) -> tuple:
+    """Determine the winning outcome from a resolved market.
+
+    Handles two Gamma API market schemas:
+      - AMM markets: use tokens[].winner (bool) or winnerOutcome field
+      - CLOB markets: use outcomePrices JSON string ("1" = winner, "0" = loser)
+
+    Returns:
+        (winning_outcome_str, outcome_label)
+        winning_outcome_str: uppercased name of winning outcome, or None
+        outcome_label: 1 (YES/first wins), 0 (NO/second wins), -1 (unknown)
+    """
+    # 1. AMM token-based resolution
+    for tok in market.get("tokens", []):
+        if tok.get("winner"):
+            wo = str(tok.get("outcome", "")).upper()
+            if wo in ("YES", "TRUE", "1"):
+                return wo, 1
+            elif wo in ("NO", "FALSE", "0"):
+                return wo, 0
+            return wo, -1
+
+    # 2. winnerOutcome field (AMM markets)
+    wo = str(market.get("winnerOutcome", "")).upper()
+    if wo in ("YES", "TRUE", "1"):
+        return wo, 1
+    elif wo in ("NO", "FALSE", "0"):
+        return wo, 0
+    elif wo:
+        return wo, -1
+
+    # 3. outcomePrices (CLOB markets) — JSON string: '["1", "0"]'
+    op_raw  = market.get("outcomePrices", "[]")
+    out_raw = market.get("outcomes", "[]")
+    try:
+        op  = json.loads(op_raw)  if isinstance(op_raw,  str) else list(op_raw)
+        out = json.loads(out_raw) if isinstance(out_raw, str) else list(out_raw)
+        for i, p in enumerate(op):
+            if float(p) >= 0.99 and i < len(out):
+                wo = str(out[i]).upper()
+                if wo in ("YES", "TRUE", "1"):
+                    return wo, 1
+                elif wo in ("NO", "FALSE", "0"):
+                    return wo, 0
+                # Non-binary label (Over/Under, Team A/B, etc.)
+                # Position 0 = first/YES equivalent, position 1 = second/NO equivalent
+                return wo, (1 if i == 0 else 0)
+    except Exception:
+        pass
+
+    return None, -1
+
+
 # ─── Gamma API Fetchers ─────────────────────────────────────────────────────────
 
-def fetch_resolved_markets(limit: int = 100, offset: int = 0,
-                           cutoff_date: Optional[datetime] = None) -> list:
-    """Fetch a page of resolved (closed) markets from the Gamma API."""
+def fetch_resolved_markets(limit: int = 100, offset: int = 0) -> list:
+    """Fetch a page of resolved (closed) markets from the Gamma API.
+
+    Note: API returns oldest-first by default. Use find_start_offset() to
+    jump to the right position before calling this in a loop.
+    """
     params = {
         "closed": "true",
         "limit": limit,
         "offset": offset,
-        "order": "end_date_iso",
-        "ascending": "false",
     }
-    if cutoff_date:
-        params["end_date_min"] = cutoff_date.strftime("%Y-%m-%dT%H:%M:%SZ")
-
     resp = SESSION.get(f"{BASE_URL}/markets", params=params, timeout=30)
     resp.raise_for_status()
     return resp.json()
+
+
+def find_start_offset(cutoff_date: datetime,
+                      lo: int = 0, hi: int = 600_000) -> int:
+    """Binary search for the first offset whose endDateIso >= cutoff_date.
+
+    The Gamma API returns markets oldest-first. This finds the offset that
+    lands just before our desired cutoff so we collect only recent markets.
+    """
+    print(f"  [binary search] Finding offset for cutoff {cutoff_date.date()} ...")
+    while lo < hi:
+        mid = (lo + hi) // 2
+        try:
+            page = fetch_resolved_markets(limit=1, offset=mid)
+        except Exception:
+            # If request fails, back off
+            hi = mid
+            continue
+        if not page:
+            hi = mid
+            continue
+        end_dt = parse_date(page[0].get("endDateIso") or page[0].get("end_date_iso"))
+        if end_dt is None or end_dt < cutoff_date:
+            lo = mid + 1
+        else:
+            hi = mid
+    # Step back a bit to avoid missing edge records
+    return max(0, lo - 200)
+
 
 
 def fetch_price_history(market_id: str, resolution: int = 3600) -> pd.DataFrame:
@@ -172,20 +252,9 @@ def engineer_features(market: dict, price_history: pd.DataFrame) -> dict:
     # Volume anomaly score will be computed cross-market; set placeholder
     volume_anomaly_score = 0.0
 
-    # Outcome label: 1 = YES, 0 = NO, -1 = INVALID/unknown
-    outcome_label = -1
-    outcomes = market.get("outcomes", [])
-    winning_outcome = None
-    for tok in market.get("tokens", []):
-        if tok.get("winner"):
-            winning_outcome = tok.get("outcome", "").upper()
-    if not winning_outcome:
-        winning_outcome = str(market.get("winnerOutcome", "")).upper()
-
-    if winning_outcome in ("YES", "TRUE", "1"):
-        outcome_label = 1
-    elif winning_outcome in ("NO", "FALSE", "0"):
-        outcome_label = 0
+    # Outcome label: 1 = YES/first, 0 = NO/second, -1 = INVALID/unknown
+    winning_outcome, outcome_label = resolve_outcome(market)
+    winning_outcome = winning_outcome or ""
 
     return {
         # Identifiers
@@ -240,35 +309,39 @@ def scrape_polymarket(days: int = 90, max_markets: int = 15000,
     print(f"[Polymarket] Fetching markets resolved after {cutoff_date.date()} ...")
 
     raw_markets = []
-    offset = 0
     page_size = 100
+
+    # Binary-search to the first offset with data in our date window
+    offset = find_start_offset(cutoff_date)
+    print(f"  [binary search] Starting collection at offset {offset}")
 
     while len(raw_markets) < max_markets:
         try:
-            page = fetch_resolved_markets(limit=page_size, offset=offset,
-                                          cutoff_date=cutoff_date)
+            page = fetch_resolved_markets(limit=page_size, offset=offset)
         except requests.RequestException as e:
             print(f"  [!] Request error at offset {offset}: {e}")
             break
 
         if not page:
-            print(f"  [✓] No more markets at offset {offset}. Total: {len(raw_markets)}")
+            print(f"  [done] No more markets at offset {offset}. Total: {len(raw_markets)}")
             break
 
-        # Filter out markets too old
+        # Filter: has winner + end_date within our window.
+        # Note: some closed markets have future endDateIso (resolved early) —
+        # we skip those for the date-window filter but do NOT stop pagination.
         filtered = []
+        now = datetime.now(timezone.utc)
         for m in page:
             end_dt = parse_date(m.get("endDateIso") or m.get("end_date_iso"))
+            # Skip markets before our cutoff (too old)
             if end_dt and end_dt < cutoff_date:
-                print(f"  [✓] Past cutoff at offset {offset}. Total: {len(raw_markets)}")
-                raw_markets.extend(filtered)
-                return _process_markets(raw_markets, fetch_prices)
-            # Only include markets with a clear YES/NO outcome
-            winning = str(m.get("winnerOutcome", "")).upper()
-            tokens  = m.get("tokens", [])
-            has_winner = winning in ("YES", "NO", "TRUE", "FALSE", "1", "0") or \
-                         any(t.get("winner") for t in tokens)
-            if has_winner:
+                continue
+            # Skip markets with scheduled end date still in the future
+            # (resolved early — endDateIso not useful as "resolution date")
+            if end_dt and end_dt > now:
+                continue
+            _, outcome_label = resolve_outcome(m)
+            if outcome_label != -1:
                 filtered.append(m)
 
         raw_markets.extend(filtered)
@@ -320,7 +393,7 @@ def _process_markets(raw_markets: list, fetch_prices: bool) -> pd.DataFrame:
     # ── Save raw resolved parquet ──────────────────────────────────────────────
     raw_path = DATA_DIR / "polymarket_resolved.parquet"
     df.to_parquet(raw_path, index=False)
-    print(f"\n[✓] Saved raw resolved markets → {raw_path} ({len(df)} rows)")
+    print(f"\n[saved] Raw resolved markets -> {raw_path} ({len(df)} rows)")
 
     # ── Save features parquet ──────────────────────────────────────────────────
     feature_cols = [
@@ -334,10 +407,10 @@ def _process_markets(raw_markets: list, fetch_prices: bool) -> pd.DataFrame:
     ]
     feat_path = DATA_DIR / "features" / "market_features.parquet"
     df[feature_cols].to_parquet(feat_path, index=False)
-    print(f"[✓] Saved engineered features → {feat_path}")
+    print(f"[saved] Engineered features -> {feat_path}")
 
     # ── Category summary ───────────────────────────────────────────────────────
-    print("\n── Category Distribution ──────────────────────────────────────")
+    print("\n-- Category Distribution ------------------------------------------")
     print(df.groupby("category")["outcome_label"].agg(
         count="count",
         yes_rate="mean"
