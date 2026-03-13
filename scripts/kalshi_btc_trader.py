@@ -332,6 +332,7 @@ def main():
     parser = argparse.ArgumentParser(description="Kalshi BTC Range Market Trader")
     parser.add_argument("--bankroll", type=float, default=10.0, help="Bankroll in USD (default: 10)")
     parser.add_argument("--interval", type=int, default=60, help="Poll interval in seconds (default: 60)")
+    parser.add_argument("--once", action="store_true", help="Run one scan cycle then exit (for scheduled agents)")
     parser.add_argument("--auto-trade", action="store_true", help="(Future) auto-place orders via Kalshi API")
     parser.add_argument("--min-edge", type=float, default=MIN_EDGE_PCT, help="Min edge to signal (default: 0.08)")
     parser.add_argument("--vol", type=float, default=BTC_HOURLY_VOL_PCT, help="BTC hourly vol fraction (default: 0.01)")
@@ -390,6 +391,10 @@ def main():
             print(f"  On Kalshi, search: {top['ticker']}")
             print(f"  Buy {top['contracts']}x {top['yes_no']} at ${top['limit_price']:.2f} limit")
             print(f"  Cost: ${top['contracts'] * top['limit_price']:.2f}  |  Edge: {top['edge']*100:.1f}pp  |  Strategy: {top['strategy']}")
+
+        if args.once:
+            print("\n  [--once] Single cycle complete. Exiting.")
+            break
 
         print(f"\n  Next cycle in {args.interval}s... (Ctrl+C to stop)")
         time.sleep(args.interval)
