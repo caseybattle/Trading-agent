@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from scipy.stats import pearsonr
 
-# ─── Config ──────────────────────────────────────────────────────────────────
+# --- Config ------------------------------------------------------------------
 
 DATA_DIR    = Path(__file__).parent.parent / "data"
 FEATURE_DIR = DATA_DIR / "features"
@@ -32,7 +32,7 @@ OUTPUT_PATH    = DATA_DIR / "base_rates.json"
 N_RELIABILITY_BUCKETS = 10
 
 
-# ─── Data Loading ─────────────────────────────────────────────────────────────
+# --- Data Loading -------------------------------------------------------------
 
 def load_features(source: Optional[str] = None) -> pd.DataFrame:
     """
@@ -50,7 +50,7 @@ def load_features(source: Optional[str] = None) -> pd.DataFrame:
                                     "Run: python collect_polymarket.py --days 365")
         df = pd.read_parquet(POLY_PATH)
         df["platform"] = "polymarket"
-        print(f"[load] Polymarket features: {len(df)} rows → {POLY_PATH.name}")
+        print(f"[load] Polymarket features: {len(df)} rows -> {POLY_PATH.name}")
         return df[df["outcome_label"].isin([0, 1])].reset_index(drop=True)
 
     if source == "kalshi":
@@ -59,13 +59,13 @@ def load_features(source: Optional[str] = None) -> pd.DataFrame:
                                     "Run: python collect_kalshi.py --days 365")
         df = pd.read_parquet(KALSHI_PATH)
         df["platform"] = "kalshi"
-        print(f"[load] Kalshi features: {len(df)} rows → {KALSHI_PATH.name}")
+        print(f"[load] Kalshi features: {len(df)} rows -> {KALSHI_PATH.name}")
         return df[df["outcome_label"].isin([0, 1])].reset_index(drop=True)
 
     # Combined (preferred)
     if COMBINED_PATH.exists():
         df = pd.read_parquet(COMBINED_PATH)
-        print(f"[load] Combined features: {len(df)} rows → {COMBINED_PATH.name}")
+        print(f"[load] Combined features: {len(df)} rows -> {COMBINED_PATH.name}")
         return df[df["outcome_label"].isin([0, 1])].reset_index(drop=True)
 
     # Merge available individual files
@@ -90,11 +90,11 @@ def load_features(source: Optional[str] = None) -> pd.DataFrame:
         )
 
     df = pd.concat(frames, ignore_index=True)
-    print(f"[load] Merged {len(frames)} sources → {len(df)} total rows")
+    print(f"[load] Merged {len(frames)} sources -> {len(df)} total rows")
     return df[df["outcome_label"].isin([0, 1])].reset_index(drop=True)
 
 
-# ─── Reliability Diagram ─────────────────────────────────────────────────────
+# --- Reliability Diagram -----------------------------------------------------
 
 def compute_reliability_diagram(probs: pd.Series, outcomes: pd.Series,
                                  n_buckets: int = N_RELIABILITY_BUCKETS) -> list:
@@ -133,7 +133,7 @@ def compute_reliability_diagram(probs: pd.Series, outcomes: pd.Series,
     return buckets
 
 
-# ─── Per-Category Stats ───────────────────────────────────────────────────────
+# --- Per-Category Stats -------------------------------------------------------
 
 def compute_category_stats(cat_df: pd.DataFrame, verbose: bool = False) -> dict:
     """
@@ -154,7 +154,7 @@ def compute_category_stats(cat_df: pd.DataFrame, verbose: bool = False) -> dict:
         "base_no_rate":  round(float(1.0 - outcomes.mean()), 4),
     }
 
-    # ── Resolution time ──────────────────────────────────────────────────────
+    # -- Resolution time ------------------------------------------------------
     if "time_to_resolution_hours" in cat_df.columns:
         rt = cat_df["time_to_resolution_hours"].dropna()
         if len(rt) > 0:
@@ -165,7 +165,7 @@ def compute_category_stats(cat_df: pd.DataFrame, verbose: bool = False) -> dict:
         else:
             stats["median_time_to_resolution_hours"] = None
 
-    # ── Volume distribution ───────────────────────────────────────────────────
+    # -- Volume distribution ---------------------------------------------------
     if "volume" in cat_df.columns:
         vol = cat_df["volume"].dropna()
         if len(vol) > 0:
@@ -174,7 +174,7 @@ def compute_category_stats(cat_df: pd.DataFrame, verbose: bool = False) -> dict:
             stats["volume_median"] = round(float(vol.median()), 2)
             stats["volume_p90"]    = round(float(vol.quantile(0.90)), 2)
 
-    # ── Spread and liquidity ──────────────────────────────────────────────────
+    # -- Spread and liquidity --------------------------------------------------
     if "spread_pct" in cat_df.columns:
         sp = cat_df["spread_pct"].dropna()
         if len(sp) > 0:
@@ -187,7 +187,7 @@ def compute_category_stats(cat_df: pd.DataFrame, verbose: bool = False) -> dict:
             stats["liquidity_ratio_mean"]   = round(float(lr.mean()), 4)
             stats["liquidity_ratio_median"] = round(float(lr.median()), 4)
 
-    # ── Price predictiveness at T-7d ─────────────────────────────────────────
+    # -- Price predictiveness at T-7d -----------------------------------------
     if "price_at_T7d" in cat_df.columns:
         valid = cat_df[["price_at_T7d", "outcome_label"]].dropna()
         if len(valid) >= 10:
@@ -207,7 +207,7 @@ def compute_category_stats(cat_df: pd.DataFrame, verbose: bool = False) -> dict:
                 if verbose:
                     print(f"    [warn] T7d Pearson failed: {e}")
 
-    # ── Price predictiveness at T-1d ─────────────────────────────────────────
+    # -- Price predictiveness at T-1d -----------------------------------------
     if "price_at_T1d" in cat_df.columns:
         valid = cat_df[["price_at_T1d", "outcome_label"]].dropna()
         if len(valid) >= 10:
@@ -227,7 +227,7 @@ def compute_category_stats(cat_df: pd.DataFrame, verbose: bool = False) -> dict:
                 if verbose:
                     print(f"    [warn] T1d Pearson failed: {e}")
 
-    # ── Momentum predictiveness ───────────────────────────────────────────────
+    # -- Momentum predictiveness -----------------------------------------------
     if "price_momentum_24h" in cat_df.columns:
         valid = cat_df[["price_momentum_24h", "outcome_label"]].dropna()
         valid = valid[valid["price_momentum_24h"] != 0.0]  # drop uninformative zeros
@@ -243,7 +243,7 @@ def compute_category_stats(cat_df: pd.DataFrame, verbose: bool = False) -> dict:
                 if verbose:
                     print(f"    [warn] Momentum Pearson failed: {e}")
 
-    # ── Category calibration (Brier score using best available predictor) ────
+    # -- Category calibration (Brier score using best available predictor) ----
     # Use T1d if available, else T7d, else momentum
     category_brier = None
     for col in ("price_at_T1d", "price_at_T7d"):
@@ -266,7 +266,7 @@ def compute_category_stats(cat_df: pd.DataFrame, verbose: bool = False) -> dict:
     return stats
 
 
-# ─── Global Stats ─────────────────────────────────────────────────────────────
+# --- Global Stats -------------------------------------------------------------
 
 def compute_global_stats(df: pd.DataFrame) -> dict:
     """
@@ -323,7 +323,7 @@ def compute_global_stats(df: pd.DataFrame) -> dict:
     return global_stats
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# --- Main ---------------------------------------------------------------------
 
 def build_base_rates(min_samples: int = 20, source: Optional[str] = None,
                      verbose: bool = False) -> dict:
@@ -338,19 +338,19 @@ def build_base_rates(min_samples: int = 20, source: Optional[str] = None,
         Full base rates dictionary (also written to data/base_rates.json)
     """
     print("=" * 65)
-    print("BASE RATE EXTRACTOR — Prediction Markets")
+    print("BASE RATE EXTRACTOR -- Prediction Markets")
     print("=" * 65)
 
     # Load data
     df = load_features(source)
-    print(f"\n[✓] Loaded {len(df)} markets with valid outcomes (0/1)\n")
+    print(f"\n[[ok]] Loaded {len(df)} markets with valid outcomes (0/1)\n")
 
     if len(df) == 0:
         print("[!] No data to process.")
         return {}
 
     # Global stats
-    print("── Computing global statistics ──────────────────────────────")
+    print("-- Computing global statistics ------------------------------")
     global_stats = compute_global_stats(df)
     if verbose:
         print(f"  Total markets:   {global_stats['total_markets']}")
@@ -362,7 +362,7 @@ def build_base_rates(min_samples: int = 20, source: Optional[str] = None,
                       f"{global_stats['category_yes_rates'].get(cat, 0):.1%}")
 
     # Per-category stats
-    print("\n── Computing per-category base rates ────────────────────────")
+    print("\n-- Computing per-category base rates ------------------------")
     categories_data: dict = {}
 
     if "category" in df.columns:
@@ -408,12 +408,12 @@ def build_base_rates(min_samples: int = 20, source: Optional[str] = None,
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         json.dump(base_rates, f, indent=2, ensure_ascii=False, default=str)
 
-    print(f"\n[✓] Saved base rates → {OUTPUT_PATH}")
+    print(f"\n[[ok]] Saved base rates -> {OUTPUT_PATH}")
     print(f"    Categories: {len(categories_data)}")
     print(f"    Total markets: {global_stats['total_markets']}")
 
     # Quick calibration summary
-    print("\n── Calibration Quality Summary ──────────────────────────────")
+    print("\n-- Calibration Quality Summary ------------------------------")
     print(f"  {'Category':12s}  {'YES Rate':>9}  {'Sample N':>8}  "
           f"{'Brier T-1d':>10}  {'Skill':>8}")
     print("  " + "-" * 57)
@@ -439,7 +439,7 @@ def build_base_rates(min_samples: int = 20, source: Optional[str] = None,
     return base_rates
 
 
-# ─── CLI ──────────────────────────────────────────────────────────────────────
+# --- CLI ----------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
