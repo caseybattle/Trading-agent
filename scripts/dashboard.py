@@ -1,12 +1,12 @@
 """
-dashboard.py — Streamlit 5-tab trading dashboard
+dashboard.py -- Streamlit 5-tab trading dashboard
 
 Tabs:
-  1. Trade Lifecycle   — Open positions, pending signals, trade history
-  2. Strategy Perf     — Per-strategy P&L, Thompson sampling weights, Kelly returns by fold
-  3. Calibration       — Brier score history, calibration curve, isotonic correction
-  4. Correlation Map   — Portfolio correlation heatmap + arbitrage signals
-  5. Live Positions    — Real-time exposure, daily P&L, risk limits gauge
+  1. Trade Lifecycle   -- Open positions, pending signals, trade history
+  2. Strategy Perf     -- Per-strategy P&L, Thompson sampling weights, Kelly returns by fold
+  3. Calibration       -- Brier score history, calibration curve, isotonic correction
+  4. Correlation Map   -- Portfolio correlation heatmap + arbitrage signals
+  5. Live Positions    -- Real-time exposure, daily P&L, risk limits gauge
 
 Run: streamlit run scripts/dashboard.py
 """
@@ -42,7 +42,7 @@ RISK_LIMITS = {
 
 st.set_page_config(
     page_title="Prediction Market Bot",
-    page_icon="📊",
+    page_icon=":chart_with_upwards_trend:",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -108,7 +108,7 @@ def load_features() -> pd.DataFrame:
 
 
 def _placeholder_chart(message: str) -> None:
-    st.info(f"📋 {message}")
+    st.info(message)
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +222,7 @@ def tab_strategy_performance() -> None:
     # Fold metrics summary
     st.subheader("Walk-Forward CV Results")
     col1, col2, col3 = st.columns(3)
-    col1.metric("Mean AUC", f"{fold_df['auc'].mean():.4f}", f"±{fold_df['auc'].std():.4f}")
+    col1.metric("Mean AUC", f"{fold_df['auc'].mean():.4f}", f"+/-{fold_df['auc'].std():.4f}")
     col2.metric("Mean Brier", f"{fold_df['brier_score'].mean():.4f}")
     col3.metric("Mean Kelly Return", f"{fold_df['kelly_return'].mean():+.2%}")
 
@@ -326,7 +326,7 @@ def tab_calibration() -> None:
 
     # Calibration curve from features
     features_df = load_features()
-    if not features_df.empty and "outcome" in features_df.columns and "prior_resolution_rate" in features_df.columns:
+    if not features_df.empty and "outcome_label" in features_df.columns and "prior_resolution_rate" in features_df.columns:
         st.subheader("Calibration Curve: Prior Resolution Rate vs. Actual Outcome")
 
         prob_col = "prior_resolution_rate"
@@ -334,7 +334,7 @@ def tab_calibration() -> None:
         features_df["prob_bin"] = pd.cut(features_df[prob_col], bins=bins, labels=False)
         cal_data = features_df.groupby("prob_bin").agg(
             predicted_mean=(prob_col, "mean"),
-            actual_rate=("outcome", "mean"),
+            actual_rate=("outcome_label", "mean"),
             count=(prob_col, "count"),
         ).reset_index()
 
@@ -375,7 +375,7 @@ def tab_calibration() -> None:
         if not iso_df.empty and HAS_PLOTLY:
             fig = px.line(
                 iso_df, x="raw_prob", y="corrected_prob",
-                title="Isotonic Calibration Map (raw → corrected)",
+                title="Isotonic Calibration Map (raw -> corrected)",
             )
             fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines",
                                      name="Identity", line=dict(dash="dash")))
