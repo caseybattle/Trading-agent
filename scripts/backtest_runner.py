@@ -300,7 +300,12 @@ def run_monte_carlo(
     returns = np.array([r[0] for r in results])
     drawdowns = np.array([r[1] for r in results])
 
-    sharpe = (returns.mean() / (returns.std() + 1e-9)) * np.sqrt(252)  # Annualized proxy
+    _std = returns.std()
+    if _std < 1e-6:
+        sharpe = 0.0
+    else:
+        sharpe = (returns.mean() / _std) * np.sqrt(252)  # Annualized proxy
+    sharpe = float(np.clip(sharpe, -50.0, 50.0))
     prob_ruin = float((returns < -0.50).mean())
 
     return MonteCarloResults(
