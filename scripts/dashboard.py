@@ -29,9 +29,11 @@ try:
 except ImportError:
     HAS_PLOTLY = False
 
-DATA_DIR = Path("data")
-BACKTEST_DIR = Path("backtest")
-TRADES_DIR = Path("trades")
+# Resolve paths relative to project root (parent of scripts/), not CWD
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = _PROJECT_ROOT / "data"
+BACKTEST_DIR = _PROJECT_ROOT / "backtest"
+TRADES_DIR = _PROJECT_ROOT / "trades"
 
 RISK_LIMITS = {
     "per_market_pct": 0.05,
@@ -199,7 +201,7 @@ def tab_trade_lifecycle() -> None:
                 title="Cumulative PnL (Closed Trades)",
                 labels={"cumulative_pnl": "Cumulative PnL", "entered_at": "Date"},
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="100%")
     else:
         st.info("No closed trades yet.")
 
@@ -239,7 +241,7 @@ def tab_strategy_performance() -> None:
             yaxis2=dict(title="AUC", overlaying="y", side="right"),
             legend=dict(x=0, y=1),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="100%")
     else:
         st.dataframe(fold_df, use_container_width=True)
 
@@ -274,7 +276,7 @@ def tab_strategy_performance() -> None:
                       annotation_text=f"Median: {np.median(mc_returns):+.2%}")
         fig.add_vline(x=np.percentile(mc_returns, 5), line_color="red", line_dash="dot",
                       annotation_text=f"P5: {np.percentile(mc_returns, 5):+.2%}")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="100%")
 
     # Thompson sampling weights (simulated if no live data)
     st.subheader("Strategy Weights (Thompson Sampling)")
@@ -297,7 +299,7 @@ def tab_strategy_performance() -> None:
             labels={"x": "Strategy", "y": "Estimated Win Rate"},
             color=means, color_continuous_scale="Blues",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="100%")
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +322,7 @@ def tab_calibration() -> None:
             )
             fig.add_hline(y=0.25, line_dash="dash", line_color="red",
                           annotation_text="Coin-flip baseline (0.25)")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="100%")
     else:
         st.info("No calibration history yet. Data will appear after live trading starts.")
 
@@ -365,7 +367,7 @@ def tab_calibration() -> None:
                 xaxis_title="Predicted Probability",
                 yaxis_title="Actual Frequency",
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="100%")
         else:
             st.dataframe(cal_data, use_container_width=True)
     else:
@@ -390,7 +392,7 @@ def tab_calibration() -> None:
             )
             fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines",
                                      name="Identity", line=dict(dash="dash")))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="100%")
 
 
 # ---------------------------------------------------------------------------
@@ -420,7 +422,7 @@ def tab_correlation_map() -> None:
             title="Distribution of Market Correlations",
             labels={"correlation": "Correlation Coefficient"},
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="100%")
 
     # Top correlated pairs
     st.subheader("Top 20 Most Correlated Pairs")
@@ -452,7 +454,7 @@ def tab_correlation_map() -> None:
                     title="Portfolio Correlation Matrix",
                     zmin=-1, zmax=1,
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="100%")
 
     # Arbitrage signals section
     st.subheader("Arbitrage Signal Detection")
@@ -532,7 +534,7 @@ def tab_live_positions() -> None:
                 line_dash="dash", line_color="red",
                 annotation_text=f"Category limit ({RISK_LIMITS['category_pct']:.0%})",
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="100%")
         else:
             st.dataframe(cat_exposure, use_container_width=True)
 
