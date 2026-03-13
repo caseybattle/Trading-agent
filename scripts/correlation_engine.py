@@ -111,13 +111,13 @@ def build_correlation_graph(
         outcome_threshold: Minimum outcome correlation to keep edge
         alpha: Blend weight for text vs. outcome correlation
     """
-    required = {"market_id", "question", "category", "outcome"}
+    required = {"market_id", "question", "category", "outcome_label"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Missing columns: {missing}")
 
-    df = df.dropna(subset=["market_id", "question", "outcome"]).copy()
-    df["outcome"] = df["outcome"].astype(int)
+    df = df.dropna(subset=["market_id", "question", "outcome_label"]).copy()
+    df["outcome_label"] = df["outcome_label"].astype(int)
     df = df.reset_index(drop=True)
 
     log.info(f"Building correlation graph from {len(df)} markets...")
@@ -136,7 +136,7 @@ def build_correlation_graph(
     graph.market_count = len(df)
 
     id_col = df["market_id"].tolist()
-    outcomes = df["outcome"].values
+    outcomes = df["outcome_label"].values
 
     # Process category by category to keep memory bounded
     for cat, group_df in df.groupby("category"):
