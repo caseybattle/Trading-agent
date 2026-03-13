@@ -80,10 +80,12 @@ class MLStrategy(BaseStrategy):
     name = "MLStrategy"
 
     FEATURE_COLS = [
-        "time_to_resolution_hours", "days_since_market_open",
-        "volume", "open_interest", "liquidity_ratio",
-        "price_momentum_24h", "price_volatility_7d",
-        "volume_anomaly_score", "spread_pct",
+        "time_to_resolution_hours",
+        "days_since_market_open",
+        "volume",
+        "price_at_T7d",        # 97.4% populated — market sentiment signal
+        "price_momentum_24h",  # 100% populated — late drift toward resolution
+        "price_volatility_7d", # 100% populated — uncertainty proxy
     ]
 
     def __init__(self):
@@ -100,10 +102,27 @@ class MLStrategy(BaseStrategy):
 
         for cat in df["category"].unique():
             mask = df["category"] == cat
-            sub = df[mask].dropna(subset=self.FEATURE_COLS + ["outcome_label"])
+            # Only drop rows missing the label or the fully-populated features;
+            # price_at_T7d (97.4% populated) is intentionally kept with NaN —
+            # XGBoost tree_method="hist" handles NaN natively via learned splits.
+            required_cols = [
+                "time_to_resolution_hours",
+                "days_since_market_open",
+                "volume",
+                "price_momentum_24h",
+                "price_volatility_7d",
+                "outcome_label",
+            ]
+            sub = df[mask].dropna(subset=required_cols)
             if len(sub) < 30:
                 continue
-            X = sub[self.FEATURE_COLS].fillna(0)
+            # Ensure all FEATURE_COLS exist (price_at_T7d may be absent in some
+            # older dataframes; add as NaN column so XGBoost can handle it).
+            for col in self.FEATURE_COLS:
+                if col not in sub.columns:
+                    sub = sub.copy()
+                    sub[col] = float("nan")
+            X = sub[self.FEATURE_COLS]   # NaN in price_at_T7d passed as-is
             y = sub["outcome_label"].astype(int)
             model = xgb.XGBClassifier(
                 n_estimators=200,
@@ -113,6 +132,7 @@ class MLStrategy(BaseStrategy):
                 colsample_bytree=0.8,
                 eval_metric="logloss",
                 use_label_encoder=False,
+                tree_method="hist",  # enables native NaN handling in splits
                 random_state=42,
                 n_jobs=-1,
             )
@@ -128,8 +148,16 @@ class MLStrategy(BaseStrategy):
                              market.get("price_at_T7d") or 0.5)
 
         if self._fitted and cat in self._models:
-            X = np.array([[market.get(f, 0.0) or 0.0
-                           for f in self.FEATURE_COLS]])
+            # Build feature vector; price_at_T7d may be NaN — pass it through
+            # so XGBoost uses its trained NaN split direction (tree_method="hist").
+            feat_vals = []
+            for f in self.FEATURE_COLS:
+                v = market.get(f)
+                if v is None or (isinstance(v, float) and np.isnan(v)):
+                    feat_vals.append(np.nan)
+                else:
+                    feat_vals.append(float(v) if v else 0.0)
+            X = np.array([feat_vals])
             try:
                 prob = float(self._models[cat].predict_proba(X)[0, 1])
                 confidence = abs(prob - 0.5) * 2  # distance from 50/50
