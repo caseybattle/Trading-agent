@@ -1,0 +1,188 @@
+[
+  {
+    "id": "eval_correlation_penalty",
+    "description": "Verify correlation_penalty() correctly reduces Kelly sizing for correlated positions",
+    "type": "unit",
+    "module": "scripts.correlation_engine",
+    "function": "correlation_penalty",
+    "setup": {
+      "graph": {
+        "edges": {
+          "market_btc_100k": {"market_btc_90k": 0.85, "market_eth_5k": 0.42},
+          "market_btc_90k": {"market_btc_100k": 0.85},
+          "market_eth_5k": {"market_btc_100k": 0.42}
+        }
+      },
+      "current_positions": {
+        "market_btc_90k": 0.04,
+        "market_eth_5k": 0.02
+      }
+    },
+    "cases": [
+      {
+        "name": "high_correlation_reduces_sizing",
+        "input": {
+          "market_id": "market_btc_100k",
+          "current_positions": {"market_btc_90k": 0.04, "market_eth_5k": 0.02},
+          "graph": "__setup__.graph"
+        },
+        "expected": {
+          "type": "range",
+          "min": 0.35,
+          "max": 0.75,
+          "description": "Penalty should be significant (0.35–0.75) given 0.85 correlation with a 4% position"
+        }
+      },
+      {
+        "name": "no_positions_zero_penalty",
+        "input": {
+          "market_id": "market_btc_100k",
+          "current_positions": {},
+          "graph": "__setup__.graph"
+        },
+        "expected": {
+          "type": "exact",
+          "value": 0.0,
+          "description": "Empty portfolio → penalty must be exactly 0.0"
+        }
+      },
+      {
+        "name": "unrelated_market_zero_penalty",
+        "input": {
+          "market_id": "market_election_2026",
+          "current_positions": {"market_btc_90k": 0.04},
+          "graph": "__setup__.graph"
+        },
+        "expected": {
+          "type": "exact",
+          "value": 0.0,
+          "description": "Market with no edges in graph → penalty must be 0.0"
+        }
+      }
+    ],
+    "success_criteria": "All 3 cases pass. kelly_adj = kelly_raw * max(0.1, 1 - penalty) must always be in (0, kelly_raw]."
+  },
+  {
+    "id": "eval_arbitrage_detection",
+    "description": "Verify detect_arbitrage() flags price inconsistencies between correlated markets",
+    "type": "unit",
+    "module": "scripts.correlation_engine",
+    "function": "detect_arbitrage",
+    "setup": {
+      "graph": {
+        "edges": {
+          "market_a": {"market_b": 0.90},
+          "market_b": {"market_a": 0.90},
+          "market_c": {"market_d": 0.30},
+          "market_d": {"market_c": 0.30}
+        }
+      }
+    },
+    "cases": [
+      {
+        "name": "complementary_arbitrage_detected",
+        "description": "market_a at 0.80, market_b at 0.80 — complement check: |0.80 - (1-0.80)| = 0.60 > threshold",
+        "input": {
+          "live_prices": {"market_a": 0.80, "market_b": 0.80},
+          "graph": "__setup__.graph",
+          "threshold": 0.15
+        },
+        "expected": {
+          "type": "assert",
+          "checks": [
+            "len(signals) == 1",
+            "signals[0].market_a in ('market_a', 'market_b')",
+            "signals[0].implied_gap >= 0.15",
+            "signals[0].signal_strength == signals[0].correlation * signals[0].implied_gap"
+          ]
+        }
+      },
+      {
+        "name": "consistent_prices_no_signal",
+        "description": "market_a + market_b ~= 1.0 and both similar → no arbitrage",
+        "input": {
+          "live_prices": {"market_a": 0.60, "market_b": 0.41},
+          "graph": "__setup__.graph",
+          "threshold": 0.15
+        },
+        "expected": {
+          "type": "assert",
+          "checks": [
+            "len(signals) == 0"
+          ]
+        }
+      },
+      {
+        "name": "low_correlation_below_threshold",
+        "description": "Price gap exists but corr=0.30 produces weak signal_strength < threshold effect",
+        "input": {
+          "live_prices": {"market_c": 0.80, "market_d": 0.80},
+          "graph": "__setup__.graph",
+          "threshold": 0.15
+        },
+        "expected": {
+          "type": "assert",
+          "checks": [
+            "len(signals) == 1",
+            "signals[0].correlation == 0.30",
+            "signals[0].signal_strength < 0.25"
+          ]
+        }
+      }
+    ],
+    "success_criteria": "Signals are correctly detected, ordered by signal_strength descending, and signal_strength = correlation * implied_gap."
+  },
+  {
+    "id": "eval_kelly_holdout_discipline",
+    "description": "Verify backtest_runner enforces 20% holdout and never trains on holdout data",
+    "type": "integration",
+    "module": "scripts.backtest_runner",
+    "function": "run_full_backtest",
+    "setup": {
+      "synthetic_features": {
+        "description": "Generate 500 synthetic markets with time-ordered end_date spanning 12 months",
+        "n_markets": 500,
+        "columns": ["market_id", "end_date", "time_to_resolution_hours", "liquidity_ratio",
+                    "price_momentum_24h", "price_volatility_7d", "volume_anomaly_score",
+                    "spread_pct", "days_since_market_open", "prior_resolution_rate", "outcome"]
+      }
+    },
+    "cases": [
+      {
+        "name": "holdout_size_exactly_20_percent",
+        "description": "BacktestReport.total_holdout_size must be >= 95 (19%) and <= 105 (21%) of 500",
+        "expected": {
+          "type": "range",
+          "field": "report.total_holdout_size",
+          "min": 95,
+          "max": 110,
+          "description": "Holdout is ~20% of 500 markets; exact count depends on quantile boundary"
+        }
+      },
+      {
+        "name": "train_plus_holdout_equals_total",
+        "description": "total_train_size + total_holdout_size must equal number of non-NaN outcome rows",
+        "expected": {
+          "type": "assert",
+          "checks": [
+            "report.total_train_size + report.total_holdout_size == n_valid_markets"
+          ]
+        }
+      },
+      {
+        "name": "holdout_metrics_computed_separately",
+        "description": "holdout_auc and holdout_brier must be set (not None/NaN) and reasonable",
+        "expected": {
+          "type": "assert",
+          "checks": [
+            "report.holdout_auc is not None",
+            "0.40 <= report.holdout_auc <= 1.0",
+            "report.holdout_brier is not None",
+            "0.0 <= report.holdout_brier <= 0.50"
+          ]
+        }
+      }
+    ],
+    "success_criteria": "Holdout enforced at ~20%, train+holdout=total, holdout metrics computed independently from training data. Fold results must only reference training split indices."
+  }
+]
