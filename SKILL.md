@@ -110,6 +110,36 @@ Opens at `http://localhost:8501` with 5 tabs:
 
 ---
 
+### Phase 6: Live Trading
+
+> **Default mode: paper trading** — no real orders placed, signals logged to `trades/live_trades.parquet`.
+
+```bash
+# Single scan cycle (paper mode)
+python scripts/live_trader.py --run --paper
+
+# Daemon mode — scan every 3600s (paper mode)
+python scripts/live_trader.py --daemon --paper
+
+# Dry run — verify pipeline without recording trades
+python scripts/live_trader.py --run --dry-run
+
+# Live mode (requires POLY_PRIVATE_KEY environment variable)
+export POLY_PRIVATE_KEY=<your_private_key>
+python scripts/live_trader.py --run --live --bankroll 10000
+```
+
+Each scan cycle:
+1. Fetches active Polymarket markets with ≥$10k liquidity (Gamma API)
+2. Engineers the 7 ML features (`time_to_resolution_hours`, `days_since_market_open`, `volume`, `volume_anomaly_score`, `price_at_T7d`, `price_momentum_24h`, `price_volatility_7d`)
+3. Fits StrategyEnsemble on 80% of historical features (refit every cycle)
+4. For each candidate: predict → isotonic calibration → `portfolio_kelly_check()` gate
+5. Records up to 5 new trades per cycle; updates existing open positions
+6. Enforces 3% daily loss hard stop
+7. Persists to `trades/live_trades.parquet` (schema matches dashboard Tab 1 + Tab 5)
+
+---
+
 ## Strategy Descriptions
 
 All strategies are implemented in `scripts/strategy_ensemble.py`. The Thompson sampling bandit (Beta(α, β) posteriors) selects among them based on historical Brier score performance.
@@ -154,6 +184,7 @@ Kelly formula: `kelly_raw * max(0.1, 1 - correlation_penalty(market_id, current_
 | `correlation_engine.py` | Cross-market correlation graph + arbitrage |
 | `backtest_runner.py` | Walk-forward CV + Monte Carlo + parallel CPU |
 | `dashboard.py` | Streamlit 5-tab live dashboard |
+| `live_trader.py` | Paper/live trading engine — scan, predict, size, record |
 
 ---
 
