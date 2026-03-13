@@ -38,15 +38,16 @@ DATA_DIR = Path("data")
 BACKTEST_DIR = Path("backtest")
 FEATURES_PATH = DATA_DIR / "features" / "market_features.parquet"
 
-NUMERIC_FEATURES = [
+# Features available in data/features/market_features.parquet that are:
+#   - populated (non-null/non-constant) for all markets
+#   - measured BEFORE market resolution (no leakage)
+# Removed: spread_pct (leakage — encodes resolution state), price_at_T7d/T1d (all null),
+#   price_momentum_24h/price_volatility_7d/open_interest (all 0.0),
+#   liquidity_ratio (duplicate of volume), prior_resolution_rate (missing from parquet)
+NUMERIC_FEATURES: List[str] = [
     "time_to_resolution_hours",
-    "liquidity_ratio",
-    "price_momentum_24h",
-    "price_volatility_7d",
-    "volume_anomaly_score",
-    "spread_pct",
     "days_since_market_open",
-    "prior_resolution_rate",
+    "volume",
 ]
 LABEL_COL = "outcome_label"
 DATE_COL = "end_date"
@@ -257,9 +258,11 @@ def _mc_trial(
     y_pred: np.ndarray,
     seed: int,
 ) -> Tuple[float, float]:
-    """Single Monte Carlo trial: shuffle trade order, return (pnl_fraction, max_dd)."""
+    """Single Monte Carlo trial: bootstrap resample trades, return (pnl_fraction, max_dd)."""
     rng = np.random.default_rng(seed)
-    idx = rng.permutation(len(y_true))
+    # Bootstrap resample WITH replacement — each trial uses a different subset of trades
+    # This models uncertainty in which opportunities the bot encounters
+    idx = rng.choice(len(y_true), size=len(y_true), replace=True)
     pnl, _, max_dd = _simulate_kelly_trading(y_true[idx], y_pred[idx])
     return pnl, max_dd
 
