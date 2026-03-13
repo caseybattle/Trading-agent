@@ -9,6 +9,7 @@ Usage:
     python collect_polymarket.py --max 5000      # Cap at 5000 markets
 """
 
+import math
 import requests
 import pandas as pd
 import numpy as np
@@ -399,8 +400,14 @@ def engineer_features(market: dict, price_history: pd.DataFrame) -> dict:
     # Spread
     spread_pct = (best_ask - best_bid) if (best_ask and best_bid) else 0.0
 
-    # Liquidity ratio (volume / open interest)
-    liquidity_ratio = volume / max(open_int, 1.0)
+    # Log-normalized volume as a proxy for market size/liquidity.
+    # The Gamma API returns openInterest=0 for all resolved markets, so
+    # volume/max(open_int,1) degenerates to raw volume — not a ratio at all.
+    # Instead, use log1p-normalized volume scaled to [0, ~1] assuming a
+    # practical maximum of ~$10M: log1p(0)/log1p(10M) = 0,
+    # log1p(5000)/log1p(10M) ≈ 0.53, log1p(100000)/log1p(10M) ≈ 0.70.
+    _LOG_MAX_VOLUME = math.log1p(10_000_000)
+    liquidity_ratio = math.log1p(volume) / _LOG_MAX_VOLUME
 
     # Time features
     resolution_hours = None
