@@ -26,9 +26,12 @@ from typing import Optional
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ─── Config ─────────────────────────────────────────────────────────────────────
-BASE_URL   = "https://trading.kalshi.com/trade-api/v2"
+BASE_URL   = "https://api.elections.kalshi.com/trade-api/v2"
 DATA_DIR   = Path(__file__).parent.parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 (DATA_DIR / "features").mkdir(exist_ok=True)
@@ -129,7 +132,7 @@ def fetch_settled_markets(session: requests.Session, limit: int = 100,
     Returns (markets_list, next_cursor).
     """
     path   = "/trade-api/v2/markets"
-    params: dict = {"status": "finalized", "limit": limit}
+    params: dict = {"status": "settled", "limit": limit}
     if cursor:
         params["cursor"] = cursor
 
