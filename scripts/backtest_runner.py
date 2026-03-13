@@ -41,13 +41,19 @@ FEATURES_PATH = DATA_DIR / "features" / "market_features.parquet"
 # Features available in data/features/market_features.parquet that are:
 #   - populated (non-null/non-constant) for all markets
 #   - measured BEFORE market resolution (no leakage)
-# Removed: spread_pct (leakage — encodes resolution state), price_at_T7d/T1d (all null),
-#   price_momentum_24h/price_volatility_7d/open_interest (all 0.0),
-#   liquidity_ratio (duplicate of volume), prior_resolution_rate (missing from parquet)
+# Removed: spread_pct (leakage — encodes resolution state),
+#   price_at_T1d (79.7% fill — below 80% threshold; momentum captures it),
+#   open_interest (all 0.0), liquidity_ratio (duplicate of volume),
+#   prior_resolution_rate (missing from parquet)
+# Added (2026-03-13): price_at_T7d (97.4% fill), price_momentum_24h (100%),
+#   price_volatility_7d (100%) — XGBoost hist handles NaN in price_at_T7d natively
 NUMERIC_FEATURES: List[str] = [
     "time_to_resolution_hours",
     "days_since_market_open",
     "volume",
+    "price_at_T7d",        # Market price 7d before resolution — 97.4% populated
+    "price_momentum_24h",  # price_at_T1d - price_at_T7d — 100% populated; captures late drift
+    "price_volatility_7d", # Std of 7d price window — 100% populated; uncertainty proxy
 ]
 LABEL_COL = "outcome_label"
 DATE_COL = "end_date"
@@ -189,6 +195,7 @@ def _make_model(n_jobs: int = 1) -> XGBClassifier:
         reg_lambda=1.0,
         use_label_encoder=False,
         eval_metric="logloss",
+        tree_method="hist",    # Required for native NaN handling (price_at_T7d has 2.6% nulls)
         n_jobs=n_jobs,
         random_state=42,
         verbosity=0,
@@ -479,8 +486,14 @@ def run_full_backtest(
     if len(available_features) < 3:
         raise ValueError(f"Too few features available: {available_features}")
 
-    train_df = train_df.dropna(subset=available_features + [LABEL_COL])
-    holdout_df = holdout_df.dropna(subset=available_features + [LABEL_COL])
+    # Only require label + always-populated features to be non-null.
+    # XGBoost (tree_method='hist') handles NaN natively for sparse features like
+    # price_at_T7d — dropping those rows would discard 15 valid training markets.
+    ALWAYS_POPULATED = ["time_to_resolution_hours", "days_since_market_open", "volume",
+                        "price_momentum_24h", "price_volatility_7d"]
+    required_non_null = [f for f in ALWAYS_POPULATED if f in available_features] + [LABEL_COL]
+    train_df = train_df.dropna(subset=required_non_null)
+    holdout_df = holdout_df.dropna(subset=required_non_null)
 
     X_train = train_df[available_features].values.astype(np.float32)
     y_train = train_df[LABEL_COL].values.astype(int)
