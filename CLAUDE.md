@@ -70,7 +70,7 @@ trades/live_trades.parquet          ← Live trade audit trail
 
 ## Platform APIs
 - **Polymarket**: `https://gamma-api.polymarket.com/markets?closed=true` (no auth)
-- **Kalshi**: `https://trading.kalshi.com/v2/markets?status=settled` (API key required)
+- **Kalshi**: `https://api.elections.kalshi.com/trade-api/v2/markets?status=settled` (API key + RSA signing required)
 - **Hyperliquid**: Perps for delta-neutral crypto hedging
 
 ## Running the Bot
