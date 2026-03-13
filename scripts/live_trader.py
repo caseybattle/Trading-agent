@@ -378,8 +378,10 @@ def fit_ensemble(ensemble: StrategyEnsemble) -> bool:
 
         # Use 80% training split (last 20% is holdout — never used in training)
         if "end_date" in hist_df.columns:
-            cutoff = hist_df["end_date"].quantile(0.80)
-            train_df = hist_df[hist_df["end_date"] <= cutoff]
+            # Parse dates — parquet stores end_date as strings; convert to datetime for quantile
+            end_dates = pd.to_datetime(hist_df["end_date"], errors="coerce", utc=True)
+            cutoff = end_dates.quantile(0.80)
+            train_df = hist_df[(end_dates <= cutoff).fillna(False)]
         else:
             train_df = hist_df
 
