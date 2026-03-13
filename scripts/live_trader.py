@@ -97,19 +97,20 @@ TRADE_COLS = [
     "market_id",       # str
     "question",        # str
     "category",        # str
+    "platform",        # str e.g. "Polymarket"
     "direction",       # "YES" | "NO"
     "entry_price",     # float 0-1
     "current_price",   # float 0-1
-    "size_fraction",   # float (fraction of bankroll)
+    "stake_pct",       # float (fraction of bankroll)
     "kelly_fraction",  # float raw kelly sizing
     "predicted_prob",  # float raw model output
     "cal_prob",        # float after isotonic calibration
     "edge",            # float cal_prob - market_price
-    "strategy_name",   # str
+    "signal_source",   # str
     "status",          # "open" | "closed" | "paper"
     "outcome",         # int  1=win 0=loss -1=pending
-    "pnl_usd",         # float realized PnL in USD
-    "opened_at",       # str ISO timestamp
+    "pnl_pct",         # float unrealized/realized PnL as fraction
+    "entered_at",      # str ISO timestamp
     "closed_at",       # str ISO timestamp or ""
     "paper",           # bool
 ]
@@ -274,7 +275,8 @@ def _engineer_features(df: pd.DataFrame, hist_df: Optional[pd.DataFrame] = None)
             .rename(columns={"mean": "vol_mean", "std": "vol_std"})
         )
         df = df.join(cat_stats, on="category", how="left")
-        df["vol_std"] = df["vol_std"].fillna(1.0).clip(lower=1.0)
+        df["vol_std"] = df["vol_std"].fillna(df["vol_mean"].clip(lower=1000.0) * 0.25)
+        df["vol_std"] = df["vol_std"].clip(lower=1000.0)
         df["vol_mean"] = df["vol_mean"].fillna(df["volume"].mean())
         df["volume_anomaly_score"] = (df["volume"] - df["vol_mean"]) / df["vol_std"]
         df.drop(columns=["vol_mean", "vol_std"], inplace=True)
@@ -400,12 +402,12 @@ def fit_ensemble(ensemble: StrategyEnsemble) -> bool:
 
 def get_open_positions(trades_df: pd.DataFrame) -> Dict[str, float]:
     """
-    Return {market_id: size_fraction} for all open trades.
+    Return {market_id: stake_pct} for all open trades.
     """
     if trades_df.empty:
         return {}
     open_trades = trades_df[trades_df["status"] == "open"]
-    return dict(zip(open_trades["market_id"], open_trades["size_fraction"].astype(float)))
+    return dict(zip(open_trades["market_id"], open_trades["stake_pct"].astype(float)))
 
 
 def check_daily_stop(state: Dict) -> bool:
@@ -432,7 +434,7 @@ def update_open_positions(
     state: Dict,
 ) -> pd.DataFrame:
     """
-    Update current_price and pnl_usd for all open positions.
+    Update current_price and pnl_pct for all open positions.
 
     Closes positions where market has resolved (market no longer active).
     """
@@ -453,18 +455,20 @@ def update_open_positions(
         mid = row["market_id"]
         direction = row.get("direction", "YES")
         entry = float(row.get("entry_price", 0.5))
-        size_frac = float(row.get("size_fraction", 0.0))
+        stake = float(row.get("stake_pct", 0.0))
 
         if mid in live_price_map:
             cur_price = live_price_map[mid]
             trades_df.at[idx, "current_price"] = cur_price
 
-            # Unrealized PnL
+            # Unrealized PnL as fraction of bankroll
             if direction == "YES":
-                pnl = (cur_price - entry) * size_frac * bankroll
+                pnl = (cur_price - entry) * stake * bankroll
             else:
-                pnl = (entry - cur_price) * size_frac * bankroll
-            trades_df.at[idx, "pnl_usd"] = round(pnl, 4)
+                pnl = (entry - cur_price) * stake * bankroll
+            prev_pnl = float(row.get("pnl_pct", 0.0))
+            pnl_delta += pnl - prev_pnl          # accumulate change in unrealized PnL
+            trades_df.at[idx, "pnl_pct"] = round(pnl, 4)
         else:
             # Market no longer in live feed — may have resolved
             log.info(f"Market {mid} not in live feed — checking resolution")
@@ -512,7 +516,7 @@ def scan_and_trade(
 
     # Load correlation graph
     try:
-        corr_graph = load_correlation_graph()
+        corr_graph = load_correlation_graph(path=_PROJECT_DIR / "data" / "market_correlations.parquet")
     except Exception as exc:
         log.warning(f"Could not load correlation graph: {exc}")
         from correlation_engine import CorrelationGraph
@@ -602,26 +606,27 @@ def scan_and_trade(
 
         # Record trade
         trade_id = f"{mid}_{int(time.time())}_{n_new}"
-        status   = "paper" if paper else "open"
+        status   = "open"  # paper flag tracked via `paper` bool column
 
         trade_row = {
             "trade_id":       trade_id,
             "market_id":      mid,
             "question":       question,
             "category":       category,
+            "platform":       "Polymarket",
             "direction":      direction,
             "entry_price":    round(p_market, 6),
             "current_price":  round(p_market, 6),
-            "size_fraction":  round(kelly_fraction, 6),
+            "stake_pct":      round(kelly_fraction, 6),
             "kelly_fraction": round(kelly_fraction, 6),
             "predicted_prob": round(raw_prob, 6),
             "cal_prob":       round(cal_prob, 6),
             "edge":           round(edge, 6),
-            "strategy_name":  strategy_name,
+            "signal_source":  strategy_name,
             "status":         status,
             "outcome":        -1,
-            "pnl_usd":        0.0,
-            "opened_at":      datetime.now(timezone.utc).isoformat(),
+            "pnl_pct":        0.0,
+            "entered_at":     datetime.now(timezone.utc).isoformat(),
             "closed_at":      "",
             "paper":          paper,
         }
