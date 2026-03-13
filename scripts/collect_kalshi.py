@@ -1,18 +1,21 @@
 """
 Kalshi Historical Market Scraper
-Pulls settled markets from the Kalshi REST API (requires API key)
+Pulls settled markets from the Kalshi REST API (requires RSA key pair)
 Stores raw data and engineers features compatible with Polymarket schema
 
 Usage:
-    export KALSHI_API_KEY="your_key_here"
+    export KALSHI_API_KEY_ID="your_key_id_here"
+    export KALSHI_PRIVATE_KEY_PATH="/path/to/private_key.pem"
     python collect_kalshi.py --days 90
     python collect_kalshi.py --days 365 --max 5000
 
+Auth: RSA PKCS1v15 SHA-256 per-request signing (Kalshi v2 API).
 API docs: https://trading.kalshi.com/docs/api/v2
 """
 
 import os
 import time
+import base64
 import argparse
 import requests
 import pandas as pd
@@ -20,6 +23,9 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
 # ─── Config ─────────────────────────────────────────────────────────────────────
 BASE_URL   = "https://trading.kalshi.com/trade-api/v2"
@@ -43,18 +49,45 @@ CATEGORY_MAP = {
 
 # ─── Auth ────────────────────────────────────────────────────────────────────────
 
-def get_session() -> requests.Session:
-    """Build an authenticated session for Kalshi API."""
-    api_key = os.environ.get("KALSHI_API_KEY", "")
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent":   "prediction-market-bot/1.0",
-        "Content-Type": "application/json",
-    })
-    if api_key:
-        session.headers["Authorization"] = f"Bearer {api_key}"
+def _load_private_key():
+    """Load the RSA private key from the PEM file at KALSHI_PRIVATE_KEY_PATH."""
+    pem_path = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "")
+    if not pem_path:
+        return None
+    with open(pem_path, "rb") as f:
+        return serialization.load_pem_private_key(f.read(), password=None)
+
+
+def _kalshi_headers(method: str, path: str) -> dict:
+    """
+    Build Kalshi RSA auth headers for a single request.
+
+    Headers required:
+      KALSHI-ACCESS-KEY       — API Key ID from env KALSHI_API_KEY_ID
+      KALSHI-ACCESS-TIMESTAMP — current time in milliseconds as a string
+      KALSHI-ACCESS-SIGNATURE — base64(RSA-PKCS1v15-SHA256(ts + METHOD + path))
+    """
+    key_id      = os.environ.get("KALSHI_API_KEY_ID", "")
+    private_key = _load_private_key()
+    ts          = str(int(time.time() * 1000))
+    headers = {
+        "Content-Type":           "application/json",
+        "KALSHI-ACCESS-KEY":      key_id,
+        "KALSHI-ACCESS-TIMESTAMP": ts,
+    }
+    if private_key and key_id:
+        msg = (ts + method.upper() + path).encode("utf-8")
+        sig = private_key.sign(msg, padding.PKCS1v15(), hashes.SHA256())
+        headers["KALSHI-ACCESS-SIGNATURE"] = base64.b64encode(sig).decode("utf-8")
     else:
-        print("[!] KALSHI_API_KEY not set — fetching public data only (limited history).")
+        print("[!] KALSHI_API_KEY_ID or KALSHI_PRIVATE_KEY_PATH not set — unauthenticated.")
+    return headers
+
+
+def get_session() -> requests.Session:
+    """Build a base session for Kalshi API (auth headers added per-request)."""
+    session = requests.Session()
+    session.headers.update({"User-Agent": "prediction-market-bot/1.0"})
     return session
 
 
@@ -95,13 +128,19 @@ def fetch_settled_markets(session: requests.Session, limit: int = 100,
     Fetch a page of settled markets.
     Returns (markets_list, next_cursor).
     """
+    path   = "/trade-api/v2/markets"
     params: dict = {"status": "finalized", "limit": limit}
     if cursor:
         params["cursor"] = cursor
 
-    resp = session.get(f"{BASE_URL}/markets", params=params, timeout=30)
+    resp = session.get(
+        f"{BASE_URL}/markets",
+        params=params,
+        headers=_kalshi_headers("GET", path),
+        timeout=30,
+    )
     if resp.status_code == 401:
-        print("[!] Kalshi auth failed — check KALSHI_API_KEY")
+        print("[!] Kalshi auth failed — check KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY_PATH")
         return [], None
     resp.raise_for_status()
 
@@ -114,9 +153,11 @@ def fetch_settled_markets(session: requests.Session, limit: int = 100,
 def fetch_market_history(session: requests.Session, ticker: str) -> pd.DataFrame:
     """Fetch price/volume history for a Kalshi market ticker."""
     try:
+        path = f"/trade-api/v2/markets/{ticker}/history"
         resp = session.get(
             f"{BASE_URL}/markets/{ticker}/history",
             params={"limit": 1000},
+            headers=_kalshi_headers("GET", path),
             timeout=20,
         )
         if resp.status_code == 200:
