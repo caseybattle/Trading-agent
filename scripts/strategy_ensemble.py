@@ -83,9 +83,10 @@ class MLStrategy(BaseStrategy):
         "time_to_resolution_hours",
         "days_since_market_open",
         "volume",
-        "price_at_T7d",        # 97.4% populated — market sentiment signal
-        "price_momentum_24h",  # 100% populated — late drift toward resolution
-        "price_volatility_7d", # 100% populated — uncertainty proxy
+        "volume_anomaly_score",  # z-scored category-relative volume, 100% populated
+        "price_at_T7d",          # 97.4% populated — market sentiment signal
+        "price_momentum_24h",    # 100% populated — late drift toward resolution
+        "price_volatility_7d",   # 100% populated — uncertainty proxy
     ]
 
     def __init__(self):
@@ -109,6 +110,7 @@ class MLStrategy(BaseStrategy):
                 "time_to_resolution_hours",
                 "days_since_market_open",
                 "volume",
+                "volume_anomaly_score",
                 "price_momentum_24h",
                 "price_volatility_7d",
                 "outcome_label",

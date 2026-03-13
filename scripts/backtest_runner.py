@@ -47,13 +47,15 @@ FEATURES_PATH = DATA_DIR / "features" / "market_features.parquet"
 #   prior_resolution_rate (missing from parquet)
 # Added (2026-03-13): price_at_T7d (97.4% fill), price_momentum_24h (100%),
 #   price_volatility_7d (100%) — XGBoost hist handles NaN in price_at_T7d natively
+# Added (2026-03-13): volume_anomaly_score (100% fill) — z-scored category-relative volume
 NUMERIC_FEATURES: List[str] = [
     "time_to_resolution_hours",
     "days_since_market_open",
     "volume",
-    "price_at_T7d",        # Market price 7d before resolution — 97.4% populated
-    "price_momentum_24h",  # price_at_T1d - price_at_T7d — 100% populated; captures late drift
-    "price_volatility_7d", # Std of 7d price window — 100% populated; uncertainty proxy
+    "volume_anomaly_score",  # z-scored category-relative volume, 100% populated
+    "price_at_T7d",          # Market price 7d before resolution — 97.4% populated
+    "price_momentum_24h",    # price_at_T1d - price_at_T7d — 100% populated; captures late drift
+    "price_volatility_7d",   # Std of 7d price window — 100% populated; uncertainty proxy
 ]
 LABEL_COL = "outcome_label"
 DATE_COL = "end_date"
@@ -490,7 +492,7 @@ def run_full_backtest(
     # XGBoost (tree_method='hist') handles NaN natively for sparse features like
     # price_at_T7d — dropping those rows would discard 15 valid training markets.
     ALWAYS_POPULATED = ["time_to_resolution_hours", "days_since_market_open", "volume",
-                        "price_momentum_24h", "price_volatility_7d"]
+                        "volume_anomaly_score", "price_momentum_24h", "price_volatility_7d"]
     required_non_null = [f for f in ALWAYS_POPULATED if f in available_features] + [LABEL_COL]
     train_df = train_df.dropna(subset=required_non_null)
     holdout_df = holdout_df.dropna(subset=required_non_null)
