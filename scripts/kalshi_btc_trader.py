@@ -12,17 +12,136 @@ Requires (pip install):
 """
 
 import argparse
+import base64
 import csv
 import math
 import os
 import sys
 import time
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
 import requests
 from scipy.stats import norm
+
+# Kalshi RSA auth — load credentials from .env
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except ImportError:
+    pass  # python-dotenv optional; credentials can also be set as env vars
+
+try:
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+    _CRYPTO_OK = True
+except ImportError:
+    _CRYPTO_OK = False
+
+_KALSHI_KEY_ID   = os.getenv("KALSHI_API_KEY_ID", "")
+_KALSHI_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
+
+
+def load_strategy_config() -> dict:
+    """Load tuned params from backtest/strategy_config.json if available."""
+    cfg_path = Path(__file__).resolve().parent.parent / "backtest" / "strategy_config.json"
+    if not cfg_path.exists():
+        return {}
+    try:
+        import json
+        with open(cfg_path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _load_private_key():
+    """Load RSA private key from PEM file."""
+    if not _KALSHI_KEY_PATH or not Path(_KALSHI_KEY_PATH).exists():
+        return None
+    try:
+        with open(_KALSHI_KEY_PATH, "rb") as f:
+            return serialization.load_pem_private_key(f.read(), password=None)
+    except Exception as e:
+        print(f"  [AUTH] Failed to load private key: {e}")
+        return None
+
+
+def build_auth_headers(method: str, path: str) -> dict:
+    """
+    Build Kalshi RSA authentication headers.
+    Signature message: timestamp_ms + nonce + METHOD + /path
+    """
+    if not _CRYPTO_OK or not _KALSHI_KEY_ID:
+        return {}
+    key = _load_private_key()
+    if key is None:
+        return {}
+    ts_ms = str(int(time.time() * 1000))
+    nonce = ""
+    msg = (ts_ms + nonce + method.upper() + path).encode("utf-8")
+    sig = key.sign(msg, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH), hashes.SHA256())
+    sig_b64 = base64.b64encode(sig).decode("utf-8")
+    return {
+        "KALSHI-ACCESS-KEY":       _KALSHI_KEY_ID,
+        "KALSHI-ACCESS-TIMESTAMP": ts_ms,
+        "KALSHI-ACCESS-SIGNATURE": sig_b64,
+        "Content-Type":            "application/json",
+    }
+
+
+def place_order(ticker: str, side: str, contracts: int, limit_price_dollars: float) -> dict | None:
+    """
+    Place a limit order on Kalshi.
+    side: "yes" or "no"
+    limit_price_dollars: e.g. 0.45 (will be converted to 45 cents)
+    Returns order response dict or None on failure.
+    """
+    if not _CRYPTO_OK or not _KALSHI_KEY_ID:
+        print("  [ORDER] Auth not available — check cryptography + .env setup.")
+        return None
+
+    path = "/trade-api/v2/portfolio/orders"
+    headers = build_auth_headers("POST", path)
+    if not headers:
+        print("  [ORDER] Failed to build auth headers.")
+        return None
+
+    yes_price_cents = round(limit_price_dollars * 100)
+    no_price_cents  = 100 - yes_price_cents
+
+    body = {
+        "ticker":          ticker,
+        "client_order_id": str(uuid.uuid4()),
+        "type":            "limit",
+        "action":          "buy",
+        "side":            side.lower(),
+        "count":           contracts,
+        "yes_price":       yes_price_cents,
+        "no_price":        no_price_cents,
+    }
+
+    try:
+        r = requests.post(
+            f"https://api.elections.kalshi.com{path}",
+            json=body,
+            headers=headers,
+            timeout=10,
+        )
+        if r.status_code in (200, 201):
+            data = r.json()
+            order = data.get("order", data)
+            print(f"  [ORDER] Placed: {side.upper()} {contracts}x {ticker} @ ${limit_price_dollars:.2f}")
+            print(f"  [ORDER] Order ID: {order.get('id', '?')} | Status: {order.get('status', '?')}")
+            return order
+        else:
+            print(f"  [ORDER] Failed ({r.status_code}): {r.text[:200]}")
+            return None
+    except Exception as e:
+        print(f"  [ORDER] Request error: {e}")
+        return None
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -43,10 +162,23 @@ SIGNAL_LOG = Path("trades/signals_log.csv")
 SIGNAL_LOG.parent.mkdir(parents=True, exist_ok=True)
 
 CSV_HEADERS = [
-    "timestamp", "ticker", "action", "yes_no",
-    "fair_value", "market_mid", "edge",
-    "kelly_fraction", "contracts", "limit_price",
-    "btc_price", "minutes_to_close", "strategy",
+    "timestamp",
+    "ticker",
+    "strategy",
+    "direction",
+    "range_label",
+    "range_low",
+    "range_high",
+    "fair_value",
+    "market_ask",
+    "market_bid",
+    "edge_pp",
+    "minutes_left",
+    "btc_price_at_signal",
+    "kelly_fraction",
+    "recommended_contracts",
+    "acted_on",
+    "outcome",
 ]
 
 
@@ -181,10 +313,85 @@ def kelly_fraction(fair_value: float, market_price: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Daily loss hard stop
+# ---------------------------------------------------------------------------
+DAILY_LOSS_STOP_PCT = 0.03
+BANKROLL_FILE = Path(__file__).resolve().parent.parent / "trades" / "bankroll.json"
+
+def check_daily_loss_stop() -> bool:
+    """Return True if daily loss exceeds 3% of starting bankroll."""
+    if not BANKROLL_FILE.exists():
+        return False
+    try:
+        import json
+        with open(BANKROLL_FILE) as f:
+            state = json.load(f)
+        starting = state.get("starting_bankroll", 10.0)
+        current = state.get("current_bankroll", starting)
+        loss = starting - current
+        if loss >= starting * DAILY_LOSS_STOP_PCT:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Duplicate order guard — ticker cooldown
+# ---------------------------------------------------------------------------
+
+def get_recent_tickers(cooldown_minutes: int = 30) -> set:
+    """Return tickers traded within the last cooldown_minutes."""
+    if not SIGNAL_LOG.exists():
+        return set()
+    recent = set()
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=cooldown_minutes)
+    try:
+        with open(SIGNAL_LOG) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                ts_str = row.get("timestamp", "")
+                ticker = row.get("ticker", "")
+                acted = row.get("acted_on", "")
+                if acted in ("AUTO", "MANUAL") and ts_str and ticker:
+                    try:
+                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        if ts >= cutoff:
+                            recent.add(ticker)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return recent
+
+
+# ---------------------------------------------------------------------------
+# Open position check
+# ---------------------------------------------------------------------------
+
+def get_open_position_tickers() -> set:
+    """Return tickers with currently OPEN positions."""
+    ledger_path = Path(__file__).resolve().parent.parent / "trades" / "live_trades.parquet"
+    if not ledger_path.exists():
+        return set()
+    try:
+        import pandas as pd
+        df = pd.read_parquet(ledger_path)
+        return set(df[df["status"] == "OPEN"]["ticker"].tolist())
+    except Exception:
+        return set()
+
+
+# ---------------------------------------------------------------------------
 # Signal generation
 # ---------------------------------------------------------------------------
 
 def generate_signals(markets: list[dict], btc_price: float, bankroll: float) -> list[dict]:
+    current_hour = datetime.now(timezone.utc).hour
+    if hasattr(sys.modules[__name__], '_avoid_hours') and current_hour in globals().get('_avoid_hours', set()):
+        print(f"  [SKIP] Hour {current_hour} UTC is in avoid_hours list from optimizer")
+        return []
+
     signals = []
 
     for m in markets:
@@ -201,6 +408,14 @@ def generate_signals(markets: list[dict], btc_price: float, bankroll: float) -> 
         no_cost = round(1.0 - m["yes_bid"], 4)
         edge_no_clean = (1 - fair) - no_cost
 
+        # Shared fields included in every signal for logging
+        _common = {
+            "range_low":          m["range_low"],
+            "range_high":         m["range_high"],
+            "market_bid":         m["yes_bid"],
+            "btc_price_at_signal": btc_price,
+        }
+
         # --- Strategy 1: Time-decay (confirmed in-range, minutes to close) ---
         in_range = m["range_low"] <= btc_price < m["range_high"]
         if in_range and m["minutes_left"] <= TIME_DECAY_THRESHOLD_MIN and fair >= TIME_DECAY_MIN_FAIR:
@@ -209,17 +424,18 @@ def generate_signals(markets: list[dict], btc_price: float, bankroll: float) -> 
                 kf = kelly_fraction(fair, m["yes_ask"])
                 contracts = max(1, int(bankroll * min(kf, MAX_POSITION_PCT) / m["yes_ask"]))
                 signals.append({
-                    "ticker": m["ticker"],
-                    "yes_no": "YES",
-                    "fair_value": round(fair, 4),
-                    "market_mid": mid,
-                    "edge": round(edge, 4),
-                    "kelly_fraction": round(kf, 4),
-                    "contracts": contracts,
-                    "limit_price": m["yes_ask"],
+                    **_common,
+                    "ticker":           m["ticker"],
+                    "yes_no":           "YES",
+                    "fair_value":       round(fair, 4),
+                    "market_mid":       mid,
+                    "edge":             round(edge, 4),
+                    "kelly_fraction":   round(kf, 4),
+                    "contracts":        contracts,
+                    "limit_price":      m["yes_ask"],
                     "minutes_to_close": m["minutes_left"],
-                    "strategy": "TIME_DECAY_IN_RANGE",
-                    "range": f"${m['range_low']:,}–${m['range_high']:,}",
+                    "strategy":         "TIME_DECAY_IN_RANGE",
+                    "range":            f"${m['range_low']:,}–${m['range_high']:,}",
                 })
 
         # --- Strategy 2: Model edge YES (overpriced probability) ---
@@ -227,17 +443,18 @@ def generate_signals(markets: list[dict], btc_price: float, bankroll: float) -> 
             kf = kelly_fraction(fair, m["yes_ask"])
             contracts = max(1, int(bankroll * min(kf, MAX_POSITION_PCT) / m["yes_ask"]))
             signals.append({
-                "ticker": m["ticker"],
-                "yes_no": "YES",
-                "fair_value": round(fair, 4),
-                "market_mid": mid,
-                "edge": round(edge_yes, 4),
-                "kelly_fraction": round(kf, 4),
-                "contracts": contracts,
-                "limit_price": m["yes_ask"],
+                **_common,
+                "ticker":           m["ticker"],
+                "yes_no":           "YES",
+                "fair_value":       round(fair, 4),
+                "market_mid":       mid,
+                "edge":             round(edge_yes, 4),
+                "kelly_fraction":   round(kf, 4),
+                "contracts":        contracts,
+                "limit_price":      m["yes_ask"],
                 "minutes_to_close": m["minutes_left"],
-                "strategy": "MODEL_UNDERPRICED_YES",
-                "range": f"${m['range_low']:,}–${m['range_high']:,}",
+                "strategy":         "MODEL_UNDERPRICED_YES",
+                "range":            f"${m['range_low']:,}–${m['range_high']:,}",
             })
 
         # --- Strategy 3: Model edge NO (market thinks too likely, buy NO) ---
@@ -246,17 +463,21 @@ def generate_signals(markets: list[dict], btc_price: float, bankroll: float) -> 
             kf = kelly_fraction(fair_no, no_cost)
             contracts = max(1, int(bankroll * min(kf, MAX_POSITION_PCT) / no_cost))
             signals.append({
-                "ticker": m["ticker"],
-                "yes_no": "NO",
-                "fair_value": round(fair_no, 4),
-                "market_mid": round(1 - mid, 4),
-                "edge": round(edge_no_clean, 4),
-                "kelly_fraction": round(kf, 4),
-                "contracts": contracts,
-                "limit_price": round(no_cost, 4),
+                **_common,
+                # For NO positions, market_bid from YES perspective is still yes_bid;
+                # the cost to buy NO = no_cost = 1 - yes_bid, so we override limit_price only.
+                "market_bid":       round(no_cost, 4),   # cost of the NO contract
+                "ticker":           m["ticker"],
+                "yes_no":           "NO",
+                "fair_value":       round(fair_no, 4),
+                "market_mid":       round(1 - mid, 4),
+                "edge":             round(edge_no_clean, 4),
+                "kelly_fraction":   round(kf, 4),
+                "contracts":        contracts,
+                "limit_price":      round(no_cost, 4),
                 "minutes_to_close": m["minutes_left"],
-                "strategy": "MODEL_UNDERPRICED_NO",
-                "range": f"${m['range_low']:,}–${m['range_high']:,}",
+                "strategy":         "MODEL_UNDERPRICED_NO",
+                "range":            f"${m['range_low']:,}–${m['range_high']:,}",
             })
 
     # Sort by edge descending
@@ -268,22 +489,57 @@ def generate_signals(markets: list[dict], btc_price: float, bankroll: float) -> 
 # Logging
 # ---------------------------------------------------------------------------
 
-def log_signal(sig: dict, btc_price: float):
+def log_signal(signal_dict: dict, bankroll: float):
+    """
+    Write one signal row to trades/signals_log.csv.
+
+    Parameters
+    ----------
+    signal_dict : dict
+        A signal produced by generate_signals().  Must contain at least:
+        ticker, strategy, yes_no, range, range_low, range_high,
+        fair_value, limit_price (= market_ask), market_bid,
+        edge, minutes_to_close, btc_price_at_signal.
+    bankroll : float
+        Current bankroll in USD, used to compute recommended_contracts.
+    """
+    market_ask = signal_dict["limit_price"]
+    direction = signal_dict["yes_no"]
+
+    # Fractional Kelly: edge / (1 - market_ask) * FRACTIONAL_KELLY, capped at MAX_POSITION_PCT
+    denom = 1.0 - market_ask
+    if denom > 0:
+        kf = min((signal_dict["edge"] / denom) * FRACTIONAL_KELLY, MAX_POSITION_PCT)
+    else:
+        kf = 0.0
+    kf = max(0.0, round(kf, 6))
+
+    # recommended_contracts = kelly_fraction * bankroll / market_ask, min 1
+    if market_ask > 0 and bankroll > 0:
+        rec_contracts = max(1, round(kf * bankroll / market_ask))
+    else:
+        rec_contracts = 1
+
     row = {
-        "timestamp": datetime.now().isoformat(),
-        "ticker": sig["ticker"],
-        "action": f"BUY {sig['yes_no']}",
-        "yes_no": sig["yes_no"],
-        "fair_value": sig["fair_value"],
-        "market_mid": sig["market_mid"],
-        "edge": sig["edge"],
-        "kelly_fraction": sig["kelly_fraction"],
-        "contracts": sig["contracts"],
-        "limit_price": sig["limit_price"],
-        "btc_price": btc_price,
-        "minutes_to_close": sig["minutes_to_close"],
-        "strategy": sig["strategy"],
+        "timestamp":            datetime.now(timezone.utc).isoformat(),
+        "ticker":               signal_dict["ticker"],
+        "strategy":             signal_dict["strategy"],
+        "direction":            direction,
+        "range_label":          signal_dict.get("range", ""),
+        "range_low":            signal_dict.get("range_low", ""),
+        "range_high":           signal_dict.get("range_high", ""),
+        "fair_value":           f"{signal_dict['fair_value']:.4f}",
+        "market_ask":           market_ask,
+        "market_bid":           signal_dict.get("market_bid", ""),
+        "edge_pp":              round(signal_dict["edge"] * 100, 2),
+        "minutes_left":         signal_dict["minutes_to_close"],
+        "btc_price_at_signal":  signal_dict.get("btc_price_at_signal", ""),
+        "kelly_fraction":       kf,
+        "recommended_contracts": rec_contracts,
+        "acted_on":             signal_dict.get("_acted_on", "MANUAL"),
+        "outcome":              "",
     }
+
     write_header = not SIGNAL_LOG.exists()
     with open(SIGNAL_LOG, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
@@ -329,6 +585,37 @@ def print_signals(signals: list[dict], btc_price: float, bankroll: float):
 # ---------------------------------------------------------------------------
 
 def main():
+    global BTC_HOURLY_VOL_PCT, MIN_EDGE_PCT, FRACTIONAL_KELLY, MAX_POSITION_PCT, TIME_DECAY_THRESHOLD_MIN, TIME_DECAY_MIN_FAIR
+    _cfg = load_strategy_config()
+    _avoid_hours = set()
+    if _cfg:
+        BTC_HOURLY_VOL_PCT = _cfg.get("btc_hourly_vol", BTC_HOURLY_VOL_PCT)
+        _me = _cfg.get("min_edge_pp", None)
+        if _me is not None:
+            MIN_EDGE_PCT = _me / 100.0  # config stores pp (8.0), code uses fraction (0.08)
+        FRACTIONAL_KELLY = _cfg.get("fractional_kelly", FRACTIONAL_KELLY)
+        MAX_POSITION_PCT = _cfg.get("max_position_pct", MAX_POSITION_PCT)
+        TIME_DECAY_THRESHOLD_MIN = _cfg.get("time_decay_threshold_min", TIME_DECAY_THRESHOLD_MIN)
+        TIME_DECAY_MIN_FAIR = _cfg.get("time_decay_min_fair", TIME_DECAY_MIN_FAIR)
+        _avoid_hours = set(_cfg.get("avoid_hours", []))
+        print(f"  [CONFIG] Loaded strategy_config.json (iteration {_cfg.get('iteration', '?')})")
+        print(f"  [CONFIG] vol={BTC_HOURLY_VOL_PCT}, min_edge={MIN_EDGE_PCT}, kelly={FRACTIONAL_KELLY}")
+
+    # Make _avoid_hours accessible at module level for generate_signals()
+    globals()['_avoid_hours'] = _avoid_hours
+
+    # File lock to prevent concurrent execution
+    LOCK_FILE = Path(__file__).resolve().parent.parent / "trades" / ".trader.lock"
+    lock_fh = None
+    try:
+        LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        lock_fh = open(LOCK_FILE, "w")
+        import msvcrt
+        msvcrt.locking(lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+    except (IOError, OSError):
+        print("  [LOCK] Another trader instance is running. Exiting.")
+        sys.exit(0)
+
     parser = argparse.ArgumentParser(description="Kalshi BTC Range Market Trader")
     parser.add_argument("--bankroll", type=float, default=10.0, help="Bankroll in USD (default: 10)")
     parser.add_argument("--interval", type=int, default=60, help="Poll interval in seconds (default: 60)")
@@ -337,8 +624,6 @@ def main():
     parser.add_argument("--min-edge", type=float, default=MIN_EDGE_PCT, help="Min edge to signal (default: 0.08)")
     parser.add_argument("--vol", type=float, default=BTC_HOURLY_VOL_PCT, help="BTC hourly vol fraction (default: 0.01)")
     args = parser.parse_args()
-
-    global MIN_EDGE_PCT, BTC_HOURLY_VOL_PCT
     MIN_EDGE_PCT = args.min_edge
     BTC_HOURLY_VOL_PCT = args.vol
 
@@ -365,6 +650,13 @@ def main():
 
         print(f"  BTC/USD: ${btc_price:,.2f}")
 
+        if check_daily_loss_stop():
+            print("  [STOP] Daily loss limit (3%) reached. Halting trading for today.")
+            if args.once:
+                break
+            time.sleep(args.interval)
+            continue
+
         markets = get_btc_range_markets()
         if not markets:
             print("  No BTC range markets found — skipping cycle.")
@@ -378,12 +670,32 @@ def main():
         print(f"\n  SIGNALS ({len(signals)} found):")
         print_signals(signals, btc_price, args.bankroll)
 
-        # Log all signals
+        # Dedup + open position guard
+        recent_tickers = get_recent_tickers(cooldown_minutes=30)
+        open_tickers = get_open_position_tickers()
+
+        # Log all signals and auto-trade eligible ones
         for s in signals:
-            log_signal(s, btc_price)
             if args.auto_trade:
-                print(f"  [AUTO-TRADE] Would place: BUY {s['contracts']}x {s['yes_no']} {s['ticker']} @ ${s['limit_price']:.2f}")
-                print("  [AUTO-TRADE] Kalshi RSA auth not yet configured — manual action required.")
+                if s["ticker"] in recent_tickers:
+                    print(f"  [DEDUP] Skipping {s['ticker']} — traded within last 30 min")
+                    log_signal(s, args.bankroll)
+                    continue
+                if s["ticker"] in open_tickers:
+                    print(f"  [OPEN] Skipping {s['ticker']} — already have open position")
+                    log_signal(s, args.bankroll)
+                    continue
+                result = place_order(
+                    ticker=s["ticker"],
+                    side=s["yes_no"],
+                    contracts=s["contracts"],
+                    limit_price_dollars=s["limit_price"],
+                )
+                if result is not None:
+                    s["_acted_on"] = "AUTO"
+                else:
+                    print(f"  [AUTO-TRADE] Order failed — manual action: BUY {s['contracts']}x {s['yes_no']} {s['ticker']} @ ${s['limit_price']:.2f}")
+            log_signal(s, args.bankroll)
 
         if signals:
             print(f"\n  ACTION REQUIRED:")

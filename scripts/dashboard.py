@@ -1,12 +1,12 @@
 """
-dashboard.py -- Streamlit 5-tab trading dashboard
+dashboard.py -- Kalshi BTC Live Trading Dashboard
 
 Tabs:
-  1. Trade Lifecycle   -- Open positions, pending signals, trade history
-  2. Strategy Perf     -- Per-strategy P&L, Thompson sampling weights, Kelly returns by fold
-  3. Calibration       -- Brier score history, calibration curve, isotonic correction
-  4. Correlation Map   -- Portfolio correlation heatmap + arbitrage signals
-  5. Live Positions    -- Real-time exposure, daily P&L, risk limits gauge
+  1. Live Markets     -- All open KXBTC markets with fair value + edge columns
+  2. Active Signals   -- Markets with edge >= 8pp; near-misses if none
+  3. Signal History   -- signals_log.csv, edge distribution, win rate, counts
+  4. Portfolio        -- Bankroll, P&L, trade history, daily P&L chart
+  5. Strategy & Backtest -- Config, backtest results, optimization history
 
 Run: streamlit run scripts/dashboard.py
 """
@@ -14,14 +14,18 @@ Run: streamlit run scripts/dashboard.py
 from __future__ import annotations
 
 import json
+import math
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
 
-import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 
-# ---- Optional imports (degrade gracefully if data missing) ----
+# ---------------------------------------------------------------------------
+# Optional Plotly (degrade gracefully)
+# ---------------------------------------------------------------------------
 try:
     import plotly.express as px
     import plotly.graph_objects as go
@@ -29,575 +33,795 @@ try:
 except ImportError:
     HAS_PLOTLY = False
 
-# Resolve paths relative to project root (parent of scripts/), not CWD
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+KALSHI_BASE    = "https://api.elections.kalshi.com/trade-api/v2"
+
+# Resolve all file paths relative to project root, not CWD
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = _PROJECT_ROOT / "data"
-BACKTEST_DIR = _PROJECT_ROOT / "backtest"
-TRADES_DIR = _PROJECT_ROOT / "trades"
 
-RISK_LIMITS = {
-    "per_market_pct": 0.05,
-    "category_pct": 0.15,
-    "total_exposure_pct": 0.40,
-    "daily_loss_stop_pct": 0.03,
-}
 
+def _load_config_params():
+    """Load model params from strategy_config.json if available."""
+    cfg_path = _PROJECT_ROOT / "backtest" / "strategy_config.json"
+    if cfg_path.exists():
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+            return (
+                cfg.get("btc_hourly_vol", 0.01),
+                cfg.get("min_edge_pp", 8.0) / 100.0,
+            )
+        except Exception:
+            pass
+    return (0.01, 0.08)
+
+
+BTC_HOURLY_VOL, MIN_EDGE = _load_config_params()
+
+SIGNAL_LOG    = _PROJECT_ROOT / "trades" / "signals_log.csv"
+BANKROLL_FILE = _PROJECT_ROOT / "trades" / "bankroll.json"
+TRADES_FILE   = _PROJECT_ROOT / "trades" / "live_trades.parquet"
+
+# ---------------------------------------------------------------------------
+# Page config (must be first Streamlit call)
+# ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Prediction Market Bot",
-    page_icon=":chart_with_upwards_trend:",
+    page_title="Kalshi BTC Trader",
+    page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
-
 # ---------------------------------------------------------------------------
-# Data loaders (cached for performance)
-# ---------------------------------------------------------------------------
-
-@st.cache_data(ttl=60)
-def load_live_trades() -> pd.DataFrame:
-    path = TRADES_DIR / "live_trades.parquet"
-    if not path.exists():
-        return pd.DataFrame(columns=[
-            "market_id", "platform", "category", "direction", "stake_pct",
-            "entry_price", "current_price", "pnl_pct", "status",
-            "entered_at", "signal_source",
-        ])
-    return pd.read_parquet(path)
-
-
-@st.cache_data(ttl=300)
-def load_backtest_summary() -> Optional[Dict]:
-    path = BACKTEST_DIR / "backtest_summary.json"
-    if not path.exists():
-        return None
-    with open(path) as f:
-        return json.load(f)
-
-
-@st.cache_data(ttl=300)
-def load_fold_results() -> pd.DataFrame:
-    path = BACKTEST_DIR / "fold_results.csv"
-    if not path.exists():
-        return pd.DataFrame()
-    return pd.read_csv(path)
-
-
-@st.cache_data(ttl=300)
-def load_mc_returns() -> Optional[np.ndarray]:
-    path = BACKTEST_DIR / "monte_carlo_returns.npy"
-    if not path.exists():
-        return None
-    return np.load(path)
-
-
-@st.cache_data(ttl=300)
-def load_correlations() -> pd.DataFrame:
-    path = DATA_DIR / "market_correlations.parquet"
-    if not path.exists():
-        return pd.DataFrame()
-    return pd.read_parquet(path)
-
-
-@st.cache_data(ttl=300)
-def load_features() -> pd.DataFrame:
-    path = DATA_DIR / "features" / "market_features.parquet"
-    if not path.exists():
-        return pd.DataFrame()
-    df = pd.read_parquet(path)
-    # Return only a sample for display performance
-    return df.tail(500) if len(df) > 500 else df
-
-
-def _placeholder_chart(message: str) -> None:
-    st.info(message)
-
-
-# ---------------------------------------------------------------------------
-# Sidebar
+# Fair value model (log-normal, inline)
 # ---------------------------------------------------------------------------
 
-def render_sidebar() -> None:
-    st.sidebar.title("Prediction Market Bot")
-    st.sidebar.markdown("---")
+def compute_fair(btc: float, low: float, high: float, minutes_left: float) -> float:
+    if btc <= 0 or minutes_left <= 0:
+        return 0.0
+    hours_left = max(minutes_left / 60, 1 / 60)
+    sigma = BTC_HOURLY_VOL * math.sqrt(hours_left)
 
-    summary = load_backtest_summary()
-    if summary:
-        st.sidebar.metric("Holdout AUC", f"{summary['holdout']['auc']:.4f}")
-        st.sidebar.metric("Holdout Brier", f"{summary['holdout']['brier_score']:.4f}")
-        holdout_kelly = summary['holdout']['kelly_return']
-        st.sidebar.metric("Holdout Kelly Return", f"{holdout_kelly:+.1%}")
-        mc = summary.get("monte_carlo", {})
-        st.sidebar.metric("MC Median Return", f"{mc.get('median_return', 0):+.1%}")
-        st.sidebar.metric("Sharpe (MC)", f"{mc.get('sharpe_median', 0):.2f}")
-        prob_ruin = mc.get("prob_ruin", 0)
-        st.sidebar.metric("Prob Ruin", f"{prob_ruin:.1%}",
-                          delta_color="inverse" if prob_ruin > 0.05 else "normal")
-    else:
-        st.sidebar.warning("No backtest data. Run backtest_runner.py first.")
+    def ncdf(x: float) -> float:
+        return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
-    st.sidebar.markdown("---")
-    if st.sidebar.button("Refresh All Data"):
-        st.cache_data.clear()
-        st.rerun()
-
+    p_high = ncdf(math.log(high / btc) / sigma) if btc < high else 1.0
+    p_low  = ncdf(math.log(low  / btc) / sigma) if btc > low  else 0.0
+    return max(0.0, min(1.0, p_high - p_low))
 
 # ---------------------------------------------------------------------------
-# Tab 1: Trade Lifecycle
+# API helpers
 # ---------------------------------------------------------------------------
 
-def tab_trade_lifecycle() -> None:
-    st.header("Trade Lifecycle")
-
-    trades = load_live_trades()
-
-    if trades.empty:
-        st.info("No trades found. Trades will appear here once live trading starts.")
-        st.markdown(
-            "**Data location**: `trades/live_trades.parquet`\n\n"
-            "Expected columns: `market_id, platform, category, direction, "
-            "stake_pct, entry_price, current_price, pnl_pct, status, "
-            "entered_at, signal_source`"
+@st.cache_data(ttl=10)
+def get_btc_price() -> float:
+    try:
+        r = requests.get(
+            "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+            timeout=5,
         )
-        return
+        return float(r.json()["data"]["amount"])
+    except Exception:
+        return 0.0
 
-    col1, col2, col3, col4 = st.columns(4)
-    open_trades = trades[trades["status"] == "open"] if "status" in trades.columns else trades
-    col1.metric("Open Positions", len(open_trades))
-    if "pnl_pct" in trades.columns:
-        total_pnl = trades[trades["status"] == "open"]["pnl_pct"].sum() if "status" in trades.columns else 0
-        col2.metric("Unrealized PnL", f"{total_pnl:+.2%}")
-    if "stake_pct" in trades.columns:
-        total_exposure = open_trades["stake_pct"].sum() if not open_trades.empty else 0
-        limit = RISK_LIMITS["total_exposure_pct"]
-        col3.metric(
-            "Total Exposure",
-            f"{total_exposure:.1%}",
-            delta=f"{total_exposure - limit:.1%} vs {limit:.0%} limit",
-            delta_color="inverse" if total_exposure > limit else "normal",
+
+@st.cache_data(ttl=15)
+def get_btc_markets() -> list[dict]:
+    try:
+        r = requests.get(
+            f"{KALSHI_BASE}/markets",
+            params={"status": "open", "limit": 200, "series_ticker": "KXBTC"},
+            headers={"Accept": "application/json"},
+            timeout=10,
         )
-    col4.metric("Platforms", trades["platform"].nunique() if "platform" in trades.columns else 0)
+        raw = r.json().get("markets", [])
+    except Exception:
+        return []
 
-    st.subheader("Open Positions")
-    if not open_trades.empty:
-        display_cols = [c for c in [
-            "market_id", "platform", "category", "direction",
-            "stake_pct", "entry_price", "current_price", "pnl_pct", "signal_source"
-        ] if c in open_trades.columns]
-        st.dataframe(open_trades[display_cols], use_container_width=True)
-    else:
-        st.info("No open positions.")
+    out = []
+    for m in raw:
+        ticker = m.get("ticker", "")
+        parts  = ticker.split("-B")
+        if len(parts) < 2 or not parts[-1].isdigit():
+            continue
 
-    st.subheader("Trade History")
-    closed = trades[trades["status"] == "closed"] if "status" in trades.columns else pd.DataFrame()
-    if not closed.empty:
-        st.dataframe(closed.tail(50), use_container_width=True)
+        range_low  = int(parts[-1])
+        step       = 250
+        range_high = range_low + step
 
-        if "pnl_pct" in closed.columns and "entered_at" in closed.columns and HAS_PLOTLY:
-            closed_sorted = closed.sort_values("entered_at")
-            closed_sorted["cumulative_pnl"] = closed_sorted["pnl_pct"].cumsum()
-            fig = px.line(
-                closed_sorted, x="entered_at", y="cumulative_pnl",
-                title="Cumulative PnL (Closed Trades)",
-                labels={"cumulative_pnl": "Cumulative PnL", "entered_at": "Date"},
-            )
-            st.plotly_chart(fig, width="100%")
-    else:
-        st.info("No closed trades yet.")
+        close_str    = m.get("close_time") or m.get("expiration_time") or ""
+        minutes_left = 9999.0
+        if close_str:
+            try:
+                ct = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
+                minutes_left = (ct - datetime.now(timezone.utc)).total_seconds() / 60
+            except Exception:
+                pass
 
+        yes_ask = float(m.get("yes_ask_dollars") or 0)
+        yes_bid = float(m.get("yes_bid_dollars") or 0)
+        vol24   = float(m.get("volume_24h_fp")   or 0)
 
-# ---------------------------------------------------------------------------
-# Tab 2: Strategy Performance
-# ---------------------------------------------------------------------------
-
-def tab_strategy_performance() -> None:
-    st.header("Strategy Performance")
-
-    fold_df = load_fold_results()
-    summary = load_backtest_summary()
-    mc_returns = load_mc_returns()
-
-    if fold_df.empty:
-        st.info("No fold results. Run `python scripts/backtest_runner.py` first.")
-        return
-
-    # Fold metrics summary
-    st.subheader("Walk-Forward CV Results")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Mean AUC", f"{fold_df['auc'].mean():.4f}", f"+/-{fold_df['auc'].std():.4f}")
-    col2.metric("Mean Brier", f"{fold_df['brier_score'].mean():.4f}")
-    col3.metric("Mean Kelly Return", f"{fold_df['kelly_return'].mean():+.2%}")
-
-    if HAS_PLOTLY:
-        fig = go.Figure()
-        fig.add_trace(go.Bar(x=fold_df["fold"], y=fold_df["kelly_return"],
-                             name="Kelly Return", marker_color="green"))
-        fig.add_trace(go.Scatter(x=fold_df["fold"], y=fold_df["auc"],
-                                 name="AUC", yaxis="y2", mode="lines+markers"))
-        fig.update_layout(
-            title="Fold Results: Kelly Return + AUC",
-            xaxis_title="Fold",
-            yaxis_title="Kelly Return",
-            yaxis2=dict(title="AUC", overlaying="y", side="right"),
-            legend=dict(x=0, y=1),
-        )
-        st.plotly_chart(fig, width="100%")
-    else:
-        st.dataframe(fold_df, use_container_width=True)
-
-    # Holdout results
-    if summary:
-        st.subheader("Holdout Evaluation (Sealed Test Set)")
-        h = summary["holdout"]
-        hcol1, hcol2, hcol3, hcol4 = st.columns(4)
-        hcol1.metric("AUC", f"{h['auc']:.4f}")
-        hcol2.metric("Brier Score", f"{h['brier_score']:.4f}")
-        hcol3.metric("Kelly Return", f"{h['kelly_return']:+.2%}")
-        hcol4.metric("Trades", h['n_trades'])
-
-        mc = summary.get("monte_carlo", {})
-        st.subheader("Monte Carlo Simulation")
-        mc1, mc2, mc3, mc4 = st.columns(4)
-        mc1.metric("Median Return", f"{mc.get('median_return', 0):+.2%}")
-        mc2.metric("P5 / P95", f"{mc.get('p5_return', 0):+.2%} / {mc.get('p95_return', 0):+.2%}")
-        mc3.metric("Sharpe", f"{mc.get('sharpe_median', 0):.2f}")
-        mc4.metric("Prob Ruin", f"{mc.get('prob_ruin', 0):.1%}",
-                   delta_color="inverse" if mc.get('prob_ruin', 0) > 0.05 else "normal")
-
-    # MC return distribution
-    if mc_returns is not None and len(mc_returns) > 0 and HAS_PLOTLY:
-        fig = px.histogram(
-            x=mc_returns, nbins=50,
-            title=f"Monte Carlo Return Distribution ({len(mc_returns)} trials)",
-            labels={"x": "Return"},
-            color_discrete_sequence=["steelblue"],
-        )
-        fig.add_vline(x=np.median(mc_returns), line_dash="dash",
-                      annotation_text=f"Median: {np.median(mc_returns):+.2%}")
-        fig.add_vline(x=np.percentile(mc_returns, 5), line_color="red", line_dash="dot",
-                      annotation_text=f"P5: {np.percentile(mc_returns, 5):+.2%}")
-        st.plotly_chart(fig, width="100%")
-
-    # Thompson sampling weights (simulated if no live data)
-    st.subheader("Strategy Weights (Thompson Sampling)")
-    strategies = ["Sentiment", "Momentum", "ML (XGBoost)", "LLM", "Ensemble"]
-    weights_path = Path("data/thompson_weights.json")
-    if weights_path.exists():
-        with open(weights_path) as f:
-            weights_data = json.load(f)
-        alphas = [weights_data.get(s, {}).get("alpha", 1) for s in strategies]
-        betas = [weights_data.get(s, {}).get("beta", 1) for s in strategies]
-        means = [a / (a + b) for a, b in zip(alphas, betas)]
-    else:
-        # Placeholder uniform weights
-        means = [0.2] * 5
-
-    if HAS_PLOTLY:
-        fig = px.bar(
-            x=strategies, y=means,
-            title="Current Thompson Sampling Weights (Beta posterior means)",
-            labels={"x": "Strategy", "y": "Estimated Win Rate"},
-            color=means, color_continuous_scale="Blues",
-        )
-        st.plotly_chart(fig, width="100%")
-
-
-# ---------------------------------------------------------------------------
-# Tab 3: Calibration
-# ---------------------------------------------------------------------------
-
-def tab_calibration() -> None:
-    st.header("Calibration")
-    st.markdown("Brier score tracking and probability calibration curves.")
-
-    cal_path = Path("data/calibration_history.parquet")
-    if cal_path.exists():
-        cal_df = pd.read_parquet(cal_path)
-
-        if "date" in cal_df.columns and "brier_score" in cal_df.columns and HAS_PLOTLY:
-            fig = px.line(
-                cal_df, x="date", y="brier_score",
-                title="Brier Score Over Time (lower is better)",
-                labels={"brier_score": "Brier Score"},
-            )
-            fig.add_hline(y=0.25, line_dash="dash", line_color="red",
-                          annotation_text="Coin-flip baseline (0.25)")
-            st.plotly_chart(fig, width="100%")
-    else:
-        st.info("No calibration history yet. Data will appear after live trading starts.")
-
-    # Calibration curve from features
-    # Use price_at_T1d as predicted probability (written by collect_polymarket.py);
-    # fall back to price_at_T7d if T1d is absent.
-    features_df = load_features()
-    prob_col: Optional[str] = None
-    if not features_df.empty and "outcome_label" in features_df.columns:
-        for candidate in ("price_at_T1d", "price_at_T7d"):
-            if candidate in features_df.columns:
-                col_valid = features_df[candidate].dropna()
-                if len(col_valid) >= 10:
-                    prob_col = candidate
-                    break
-
-    if not features_df.empty and "outcome_label" in features_df.columns and prob_col is not None:
-        st.subheader(f"Calibration Curve: {prob_col} vs. Actual Outcome")
-
-        plot_df = features_df[[prob_col, "outcome_label"]].dropna().copy()
-        bins = np.linspace(0, 1, 11)
-        plot_df["prob_bin"] = pd.cut(plot_df[prob_col], bins=bins, labels=False)
-        cal_data = plot_df.groupby("prob_bin").agg(
-            predicted_mean=(prob_col, "mean"),
-            actual_rate=("outcome_label", "mean"),
-            count=(prob_col, "count"),
-        ).reset_index()
-
-        if HAS_PLOTLY:
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=cal_data["predicted_mean"], y=cal_data["actual_rate"],
-                mode="markers+lines", name="Calibration",
-                marker=dict(size=cal_data["count"].clip(upper=200) / 10 + 5),
-            ))
-            fig.add_trace(go.Scatter(
-                x=[0, 1], y=[0, 1], mode="lines",
-                name="Perfect calibration", line=dict(dash="dash", color="gray"),
-            ))
-            fig.update_layout(
-                title="Calibration Curve",
-                xaxis_title="Predicted Probability",
-                yaxis_title="Actual Frequency",
-            )
-            st.plotly_chart(fig, width="100%")
-        else:
-            st.dataframe(cal_data, use_container_width=True)
-    else:
-        _placeholder_chart(
-            "Calibration curve requires features data. Run collect_polymarket.py then build_base_rates.py first."
-        )
-
-    # Isotonic correction info
-    iso_path = Path("data/isotonic_correction.json")
-    if iso_path.exists():
-        with open(iso_path) as f:
-            iso_data = json.load(f)
-        st.subheader("Isotonic Regression Correction")
-        iso_df = pd.DataFrame({
-            "raw_prob": iso_data.get("iso_x", []),
-            "corrected_prob": iso_data.get("iso_y", []),
+        out.append({
+            "ticker":      ticker,
+            "range_low":   range_low,
+            "range_high":  range_high,
+            "range_label": f"${range_low:,}–${range_high:,}",
+            "yes_ask":     yes_ask,
+            "yes_bid":     yes_bid,
+            "mid":         (yes_ask + yes_bid) / 2 if yes_ask and yes_bid else 0.0,
+            "volume_24h":  vol24,
+            "minutes_left": minutes_left,
+            "close_str":   close_str,
         })
-        if not iso_df.empty and HAS_PLOTLY:
-            fig = px.line(
-                iso_df, x="raw_prob", y="corrected_prob",
-                title="Isotonic Calibration Map (raw -> corrected)",
+
+    out.sort(key=lambda x: x["range_low"])
+    return out
+
+# ---------------------------------------------------------------------------
+# Data file loaders
+# ---------------------------------------------------------------------------
+
+def load_bankroll() -> tuple[float, float]:
+    """Returns (current_bankroll, starting_bankroll)."""
+    if BANKROLL_FILE.exists():
+        try:
+            with open(BANKROLL_FILE) as f:
+                data = json.load(f)
+            current  = float(data.get("current",  data.get("bankroll", 10.0)))
+            starting = float(data.get("starting", data.get("start",    current)))
+            return current, starting
+        except Exception:
+            pass
+    return 10.0, 10.0
+
+
+def load_signal_log() -> pd.DataFrame:
+    if not SIGNAL_LOG.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(SIGNAL_LOG)
+        if "timestamp" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            df = df.sort_values("timestamp", ascending=False)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def load_live_trades() -> pd.DataFrame:
+    if not TRADES_FILE.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_parquet(TRADES_FILE)
+    except Exception:
+        return pd.DataFrame()
+
+# ---------------------------------------------------------------------------
+# Signal computation (runs once per page load, reused across tabs)
+# ---------------------------------------------------------------------------
+
+def compute_signals(markets: list[dict], btc: float) -> list[dict]:
+    signals = []
+    for mkt in markets:
+        fair = mkt.get("fair", 0.0)
+        if fair <= 0:
+            continue
+        in_range = mkt["range_low"] <= btc <= mkt["range_high"]
+
+        # YES underpriced
+        if mkt["yes_ask"] > 0:
+            edge_yes = fair - mkt["yes_ask"]
+            if edge_yes >= MIN_EDGE:
+                signals.append({
+                    "direction": "YES",
+                    "ticker":    mkt["ticker"],
+                    "range":     mkt["range_label"],
+                    "fair":      fair,
+                    "ask":       mkt["yes_ask"],
+                    "edge":      edge_yes,
+                    "min_left":  mkt["minutes_left"],
+                    "in_range":  in_range,
+                })
+
+        # NO underpriced (YES overpriced)
+        if mkt["yes_bid"] > 0:
+            edge_no = mkt["yes_bid"] - fair
+            if edge_no >= MIN_EDGE:
+                signals.append({
+                    "direction": "NO",
+                    "ticker":    mkt["ticker"],
+                    "range":     mkt["range_label"],
+                    "fair":      fair,
+                    "ask":       1.0 - mkt["yes_bid"],
+                    "edge":      edge_no,
+                    "min_left":  mkt["minutes_left"],
+                    "in_range":  in_range,
+                })
+
+    signals.sort(key=lambda s: s["edge"], reverse=True)
+    return signals
+
+# ---------------------------------------------------------------------------
+# Header: title + auto-refresh control
+# ---------------------------------------------------------------------------
+
+st.title("Kalshi BTC Range Market — Live Dashboard")
+
+hcol1, hcol2 = st.columns([1, 4])
+with hcol1:
+    auto = st.checkbox("Auto-refresh (30s)", value=True)
+with hcol2:
+    st.caption(f"Last loaded: {datetime.now().strftime('%H:%M:%S')}")
+
+# ---------------------------------------------------------------------------
+# Fetch live data (once per 10-15 s, cached)
+# ---------------------------------------------------------------------------
+
+btc     = get_btc_price()
+markets = get_btc_markets()
+
+# Annotate each market with fair value
+for mkt in markets:
+    mkt["fair"] = compute_fair(btc, mkt["range_low"], mkt["range_high"], mkt["minutes_left"])
+
+signals = compute_signals(markets, btc)
+
+current_bankroll, starting_bankroll = load_bankroll()
+
+# ---------------------------------------------------------------------------
+# Top metrics row
+# ---------------------------------------------------------------------------
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("BTC / USD",           f"${btc:,.2f}" if btc else "—")
+m2.metric("Open KXBTC Markets",  len(markets))
+m3.metric(
+    "Live Signals",
+    len(signals),
+    delta="TRADE" if signals else None,
+    delta_color="normal",
+)
+m4.metric("Bankroll", f"${current_bankroll:,.2f}")
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Tab layout
+# ---------------------------------------------------------------------------
+
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "Live Markets",
+    "Active Signals",
+    "Signal History & Analytics",
+    "Portfolio",
+    "Strategy & Backtest",
+    "Loss Postmortem",
+])
+
+# ===========================================================================
+# Tab 1 — Live Markets
+# ===========================================================================
+
+with tab1:
+    if not markets:
+        st.warning(
+            "No open KXBTC markets found. "
+            "Markets may be between sessions — check back after 9 AM EST."
+        )
+    else:
+        rows = []
+        for mkt in markets:
+            in_range = mkt["range_low"] <= btc <= mkt["range_high"]
+            fair     = mkt.get("fair", 0.0)
+            edge_yes = (fair - mkt["yes_ask"]) * 100 if mkt["yes_ask"] else None
+            edge_no  = (mkt["yes_bid"] - fair) * 100  if mkt["yes_bid"] else None
+
+            # Close time in EST (UTC-5, no DST handling for simplicity)
+            close_est = "—"
+            if mkt["close_str"]:
+                try:
+                    ct = datetime.fromisoformat(mkt["close_str"].replace("Z", "+00:00"))
+                    ct_est = ct - timedelta(hours=5)
+                    close_est = ct_est.strftime("%m/%d %I:%M %p EST")
+                except Exception:
+                    pass
+
+            def fmt_edge(e: float | None) -> str:
+                if e is None:
+                    return "—"
+                sign = "+" if e >= 0 else ""
+                return f"{sign}{e:.1f}"
+
+            rows.append({
+                "Range":         ("-> " if in_range else "   ") + mkt["range_label"],
+                "Close (EST)":   close_est,
+                "Min Left":      f"{mkt['minutes_left']:.0f}m" if mkt["minutes_left"] < 9999 else "—",
+                "Fair Value":    f"{fair:.3f}" if fair else "—",
+                "YES Ask":       f"${mkt['yes_ask']:.3f}" if mkt["yes_ask"] else "—",
+                "YES Bid":       f"${mkt['yes_bid']:.3f}" if mkt["yes_bid"] else "—",
+                "Edge YES (pp)": fmt_edge(edge_yes),
+                "Edge NO (pp)":  fmt_edge(edge_no),
+                "Vol 24h":       f"${mkt['volume_24h']:,.0f}",
+                "In Range":      "YES" if in_range else "",
+                # Keep raw values for styling (will be dropped from display)
+                "_in_range":     in_range,
+                "_edge_yes":     edge_yes,
+                "_edge_no":      edge_no,
+            })
+
+        df_markets = pd.DataFrame(rows)
+        display_cols = [c for c in df_markets.columns if not c.startswith("_")]
+
+        def highlight_edge(val: object) -> str:
+            if isinstance(val, str) and val.startswith("+"):
+                try:
+                    if float(val) >= 8.0:
+                        return "color: #00ff88; font-weight: bold"
+                except ValueError:
+                    pass
+            return ""
+
+        st.dataframe(
+            df_markets[display_cols].style
+            .apply(
+                lambda row: (
+                    ["background-color: #1a3a1a; color: #00ff88"] * len(row)
+                    if df_markets.loc[row.name, "_in_range"]
+                    else [""] * len(row)
+                ),
+                axis=1,
             )
-            fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines",
-                                     name="Identity", line=dict(dash="dash")))
-            st.plotly_chart(fig, width="100%")
+            .map(highlight_edge, subset=["Edge YES (pp)", "Edge NO (pp)"]),
+            width="stretch",
+            height=min(700, 55 + len(rows) * 38),
+        )
 
+        st.caption(
+            f"-> = BTC (${btc:,.2f}) is currently in this range bucket. "
+            "Edges >= 8pp highlighted in green."
+        )
 
-# ---------------------------------------------------------------------------
-# Tab 4: Correlation Map
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Tab 2 — Active Signals
+# ===========================================================================
 
-def tab_correlation_map() -> None:
-    st.header("Portfolio Correlation Map")
+with tab2:
+    if not signals:
+        st.info("No signals above the 8pp edge threshold right now.")
 
-    corr_df = load_correlations()
-    trades = load_live_trades()
+        # Near-misses
+        if markets:
+            candidates = []
+            for mkt in markets:
+                fair = mkt.get("fair", 0.0)
+                if fair and mkt["yes_ask"]:
+                    e = (fair - mkt["yes_ask"]) * 100
+                    candidates.append({
+                        "Edge (pp)": f"{e:.1f}",
+                        "Direction": "YES",
+                        "Ticker":    mkt["ticker"],
+                        "Range":     mkt["range_label"],
+                        "Fair":      f"{fair:.3f}",
+                        "Ask":       f"${mkt['yes_ask']:.3f}",
+                        "_edge_raw": e,
+                    })
+                if fair and mkt["yes_bid"]:
+                    e = (mkt["yes_bid"] - fair) * 100
+                    candidates.append({
+                        "Edge (pp)": f"{e:.1f}",
+                        "Direction": "NO",
+                        "Ticker":    mkt["ticker"],
+                        "Range":     mkt["range_label"],
+                        "Fair":      f"{fair:.3f}",
+                        "Ask":       f"${1 - mkt['yes_bid']:.3f}",
+                        "_edge_raw": e,
+                    })
 
-    if corr_df.empty:
+            candidates.sort(key=lambda x: x["_edge_raw"], reverse=True)
+            top5 = [
+                {k: v for k, v in c.items() if not k.startswith("_")}
+                for c in candidates[:5]
+            ]
+
+            if top5:
+                st.subheader("Near-Misses (closest to 8pp threshold)")
+                st.dataframe(pd.DataFrame(top5), width="stretch")
+    else:
+        st.subheader(f"{len(signals)} Active Signal(s)")
+        for sig in signals:
+            min_left = sig["min_left"]
+            if min_left < 30:
+                urgency_label = "URGENT (<30 min)"
+                urgency_color = "#ff4444"
+            elif min_left < 120:
+                urgency_label = "ACTIVE (<2 hrs)"
+                urgency_color = "#ffaa00"
+            else:
+                urgency_label = "OPEN"
+                urgency_color = "#00aaff"
+
+            st.markdown(
+                f"<span style='color:{urgency_color}; font-weight:bold; font-size:1.1em'>"
+                f"[{urgency_label}] {sig['direction']} — {sig['ticker']}</span>",
+                unsafe_allow_html=True,
+            )
+
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Direction",    sig["direction"])
+            c2.metric("Edge",         f"+{sig['edge'] * 100:.1f}pp")
+            c3.metric("Fair Value",   f"{sig['fair']:.3f}")
+            c4.metric("Market Ask",   f"${sig['ask']:.3f}")
+            c5.metric("Min to Close", f"{min_left:.0f}m" if min_left < 9999 else "—")
+
+            st.code(sig["ticker"], language=None)
+            st.caption(
+                f"Range: {sig['range']} — "
+                f"Search this ticker on Kalshi and buy {sig['direction']}"
+            )
+            st.divider()
+
+# ===========================================================================
+# Tab 3 — Signal History & Analytics
+# ===========================================================================
+
+with tab3:
+    df_log = load_signal_log()
+
+    if df_log.empty:
         st.info(
-            "No correlation data. Run:\n"
-            "```\npython scripts/correlation_engine.py\n```"
+            "No signals logged yet. "
+            "Signal log will appear at: trades/signals_log.csv"
         )
-        return
+    else:
+        # ---- Summary counts ----
+        now_utc = datetime.now(timezone.utc)
+        today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        week_start  = today_start - timedelta(days=today_start.weekday())
 
-    st.metric("Total Correlation Edges", len(corr_df))
-    st.metric("Unique Markets in Graph", corr_df["market_a"].nunique() + corr_df["market_b"].nunique())
+        total_signals = len(df_log)
+        today_signals = 0
+        week_signals  = 0
 
-    # Correlation distribution
-    if HAS_PLOTLY:
-        fig = px.histogram(
-            corr_df, x="correlation", nbins=30,
-            title="Distribution of Market Correlations",
-            labels={"correlation": "Correlation Coefficient"},
+        if "timestamp" in df_log.columns:
+            ts = pd.to_datetime(df_log["timestamp"], utc=True, errors="coerce")
+            today_signals = int((ts >= today_start).sum())
+            week_signals  = int((ts >= week_start).sum())
+
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("Signals Today",     today_signals)
+        sc2.metric("Signals This Week", week_signals)
+        sc3.metric("All-Time Signals",  total_signals)
+
+        st.divider()
+
+        # ---- Win rate (if outcome column present) ----
+        outcome_col = next(
+            (c for c in df_log.columns if "outcome" in c.lower() or "win" in c.lower()),
+            None,
         )
-        st.plotly_chart(fig, width="100%")
+        if outcome_col:
+            win_rate = df_log[outcome_col].astype(float).mean()
+            st.metric("Win Rate", f"{win_rate:.1%}", help=f"Column: {outcome_col}")
+            st.divider()
 
-    # Top correlated pairs
-    st.subheader("Top 20 Most Correlated Pairs")
-    top_pairs = corr_df.nlargest(20, "correlation")
-    st.dataframe(top_pairs, use_container_width=True)
+        # ---- Full log table ----
+        st.subheader("Full Signal Log")
+        st.dataframe(df_log, width="stretch")
 
-    # Portfolio correlation heatmap (open positions only)
-    if not trades.empty and "market_id" in trades.columns:
-        open_ids = trades[trades["status"] == "open"]["market_id"].tolist() if "status" in trades.columns else trades["market_id"].tolist()
-        if len(open_ids) >= 2:
-            st.subheader("Open Portfolio Correlation Heatmap")
-            # Build correlation matrix from edges
-            n = len(open_ids)
-            matrix = np.eye(n)
-            id_to_idx = {mid: i for i, mid in enumerate(open_ids)}
+        # ---- Edge distribution chart ----
+        edge_col = next(
+            (c for c in df_log.columns if "edge" in c.lower()),
+            None,
+        )
+        if edge_col:
+            st.subheader("Edge Distribution")
+            edge_vals = pd.to_numeric(df_log[edge_col], errors="coerce").dropna()
+            if len(edge_vals) > 0:
+                if HAS_PLOTLY:
+                    fig = px.histogram(
+                        x=edge_vals * 100 if edge_vals.max() <= 1.0 else edge_vals,
+                        nbins=30,
+                        title="Edge Distribution (pp)",
+                        labels={"x": "Edge (pp)"},
+                        color_discrete_sequence=["steelblue"],
+                    )
+                    fig.add_vline(
+                        x=MIN_EDGE * 100,
+                        line_dash="dash",
+                        line_color="green",
+                        annotation_text=f"Min edge ({MIN_EDGE * 100:.0f}pp)",
+                    )
+                    st.plotly_chart(fig, width="stretch")
+                else:
+                    # Fallback: simple bar chart via Streamlit
+                    edge_display = edge_vals * 100 if edge_vals.max() <= 1.0 else edge_vals
+                    st.bar_chart(edge_display)
 
-            for _, row in corr_df.iterrows():
-                a, b, c = row["market_a"], row["market_b"], row["correlation"]
-                if a in id_to_idx and b in id_to_idx:
-                    i, j = id_to_idx[a], id_to_idx[b]
-                    matrix[i, j] = c
-                    matrix[j, i] = c
+# ===========================================================================
+# Tab 4 — Portfolio
+# ===========================================================================
 
-            if HAS_PLOTLY:
-                labels = [mid[:20] for mid in open_ids]  # Truncate for display
-                fig = px.imshow(
-                    matrix, x=labels, y=labels,
-                    color_continuous_scale="RdBu_r",
-                    title="Portfolio Correlation Matrix",
-                    zmin=-1, zmax=1,
+with tab4:
+    # ---- Bankroll summary ----
+    pnl        = current_bankroll - starting_bankroll
+    pnl_pct    = pnl / starting_bankroll if starting_bankroll else 0.0
+
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Current Bankroll",  f"${current_bankroll:,.2f}")
+    p2.metric("Starting Bankroll", f"${starting_bankroll:,.2f}")
+    p3.metric(
+        "P&L",
+        f"${pnl:+,.2f}",
+        delta_color="normal" if pnl >= 0 else "inverse",
+    )
+    p4.metric(
+        "P&L %",
+        f"{pnl_pct:+.2%}",
+        delta_color="normal" if pnl_pct >= 0 else "inverse",
+    )
+
+    if not BANKROLL_FILE.exists():
+        st.caption("Bankroll file not found — showing $10.00 default. Create trades/bankroll.json to persist balance.")
+
+    st.divider()
+
+    # ---- Trade history ----
+    trades_df = load_live_trades()
+
+    if trades_df.empty:
+        st.info(
+            "No trade history yet. "
+            "Trades will appear here once stored in trades/live_trades.parquet"
+        )
+    else:
+        st.subheader("Trade History")
+
+        # Show relevant columns if they exist
+        preferred_cols = [
+            "ticker", "direction", "range", "entry_price", "exit_price",
+            "stake", "pnl", "pnl_pct", "status", "entered_at", "closed_at",
+        ]
+        display_cols_t = [c for c in preferred_cols if c in trades_df.columns]
+        if not display_cols_t:
+            display_cols_t = list(trades_df.columns)
+
+        st.dataframe(trades_df[display_cols_t], width="stretch")
+
+        # ---- Daily P&L chart ----
+        date_col = next(
+            (c for c in trades_df.columns if "date" in c.lower() or "closed" in c.lower() or "entered" in c.lower()),
+            None,
+        )
+        pnl_col  = next(
+            (c for c in trades_df.columns if c.lower() in ("pnl", "pnl_pct", "profit")),
+            None,
+        )
+
+        if date_col and pnl_col and HAS_PLOTLY:
+            try:
+                chart_df = trades_df[[date_col, pnl_col]].copy()
+                chart_df[date_col] = pd.to_datetime(chart_df[date_col], errors="coerce")
+                chart_df = chart_df.dropna()
+                chart_df["date"] = chart_df[date_col].dt.date
+                daily = chart_df.groupby("date")[pnl_col].sum().reset_index()
+                daily.columns = ["date", "daily_pnl"]
+                daily = daily.sort_values("date")
+                daily["cumulative_pnl"] = daily["daily_pnl"].cumsum()
+
+                st.subheader("Daily P&L")
+                fig = go.Figure()
+                fig.add_bar(
+                    x=daily["date"],
+                    y=daily["daily_pnl"],
+                    name="Daily P&L",
+                    marker_color=[
+                        "#00cc66" if v >= 0 else "#ff4444"
+                        for v in daily["daily_pnl"]
+                    ],
                 )
-                st.plotly_chart(fig, width="100%")
+                fig.add_scatter(
+                    x=daily["date"],
+                    y=daily["cumulative_pnl"],
+                    mode="lines+markers",
+                    name="Cumulative P&L",
+                    yaxis="y2",
+                    line=dict(color="royalblue"),
+                )
+                fig.update_layout(
+                    title="Daily & Cumulative P&L",
+                    xaxis_title="Date",
+                    yaxis_title="Daily P&L",
+                    yaxis2=dict(title="Cumulative P&L", overlaying="y", side="right"),
+                    legend=dict(x=0, y=1),
+                )
+                st.plotly_chart(fig, width="stretch")
+            except Exception:
+                pass
 
-    # Arbitrage signals section
-    st.subheader("Arbitrage Signal Detection")
-    st.markdown(
-        "Markets with high correlation but inconsistent prices may present arbitrage opportunities. "
-        "Run `correlation_engine.py` with live prices to surface real-time signals."
-    )
-    arb_path = Path("data/arbitrage_signals.json")
-    if arb_path.exists():
-        with open(arb_path) as f:
-            signals = json.load(f)
-        if signals:
-            arb_df = pd.DataFrame(signals)
-            st.dataframe(arb_df.nlargest(10, "signal_strength"), use_container_width=True)
-        else:
-            st.success("No significant arbitrage signals detected.")
-    else:
-        st.info("No arbitrage signal file found. Will appear when live prices are available.")
-
-
-# ---------------------------------------------------------------------------
-# Tab 5: Live Positions
-# ---------------------------------------------------------------------------
-
-def tab_live_positions() -> None:
-    st.header("Live Positions & Risk Dashboard")
-
-    trades = load_live_trades()
-
-    # Risk gauges
-    col1, col2, col3 = st.columns(3)
-    open_trades = trades[trades["status"] == "open"] if ("status" in trades.columns and not trades.empty) else trades
-
-    total_exposure = open_trades["stake_pct"].sum() if ("stake_pct" in open_trades.columns and not open_trades.empty) else 0.0
-    daily_pnl = open_trades["pnl_pct"].sum() if ("pnl_pct" in open_trades.columns and not open_trades.empty) else 0.0
-
-    # Total exposure gauge
-    exposure_limit = RISK_LIMITS["total_exposure_pct"]
-    col1.metric(
-        "Total Exposure",
-        f"{total_exposure:.1%}",
-        f"Limit: {exposure_limit:.0%}",
-        delta_color="inverse" if total_exposure > exposure_limit * 0.9 else "normal",
-    )
-
-    # Daily PnL
-    daily_loss_limit = -RISK_LIMITS["daily_loss_stop_pct"]
-    col2.metric(
-        "Daily PnL",
-        f"{daily_pnl:+.2%}",
-        "STOP TRIGGERED" if daily_pnl < daily_loss_limit else "Within limits",
-        delta_color="inverse" if daily_pnl < daily_loss_limit else "normal",
-    )
-
-    # Number of open positions
-    col3.metric("Open Positions", len(open_trades))
-
-    # Category exposure breakdown
-    if not open_trades.empty and "category" in open_trades.columns and "stake_pct" in open_trades.columns:
-        st.subheader("Category Exposure vs. Limits")
-        cat_exposure = open_trades.groupby("category")["stake_pct"].sum().reset_index()
-        cat_exposure.columns = ["category", "exposure"]
-        cat_exposure["limit"] = RISK_LIMITS["category_pct"]
-        cat_exposure["pct_of_limit"] = cat_exposure["exposure"] / cat_exposure["limit"]
-
-        if HAS_PLOTLY:
-            fig = px.bar(
-                cat_exposure,
-                x="category", y="exposure",
-                title="Exposure by Category",
-                color="pct_of_limit",
-                color_continuous_scale="RdYlGn_r",
-                labels={"exposure": "Exposure (fraction of bankroll)"},
-            )
-            fig.add_hline(
-                y=RISK_LIMITS["category_pct"],
-                line_dash="dash", line_color="red",
-                annotation_text=f"Category limit ({RISK_LIMITS['category_pct']:.0%})",
-            )
-            st.plotly_chart(fig, width="100%")
-        else:
-            st.dataframe(cat_exposure, use_container_width=True)
-
-    # Platform breakdown
-    if not open_trades.empty and "platform" in open_trades.columns:
-        st.subheader("Exposure by Platform")
-        platform_exp = open_trades.groupby("platform")["stake_pct"].sum() if "stake_pct" in open_trades.columns else open_trades.groupby("platform").size()
-        st.bar_chart(platform_exp)
-
-    # Full positions table
-    st.subheader("All Open Positions")
-    if not open_trades.empty:
-        st.dataframe(open_trades, use_container_width=True)
-    else:
-        st.info("No open positions. System is in standby or waiting for signals above minimum edge.")
-
-    # Risk rules reference
-    with st.expander("Risk Rules Reference"):
-        st.markdown(
-            f"""
-| Rule | Limit |
-|------|-------|
-| Per-market max | {RISK_LIMITS['per_market_pct']:.0%} of bankroll |
-| Category max | {RISK_LIMITS['category_pct']:.0%} of bankroll |
-| Total exposure | {RISK_LIMITS['total_exposure_pct']:.0%} max (correlation-adjusted) |
-| Daily loss stop | {RISK_LIMITS['daily_loss_stop_pct']:.0%} hard stop |
-| Min edge to trade | 5 percentage points |
-| Fractional Kelly | 0.25x baseline, max 0.5x |
-| Min liquidity | $10k Polymarket / $5k Kalshi |
-            """
+        # ---- Per-market win/loss breakdown ----
+        market_col = next(
+            (c for c in trades_df.columns if "ticker" in c.lower() or "market" in c.lower()),
+            None,
         )
+        if market_col and pnl_col and HAS_PLOTLY:
+            try:
+                mkt_df = trades_df[[market_col, pnl_col]].copy()
+                mkt_df[pnl_col] = pd.to_numeric(mkt_df[pnl_col], errors="coerce")
+                mkt_summary = (
+                    mkt_df.groupby(market_col)[pnl_col]
+                    .agg(total_pnl="sum", trade_count="count")
+                    .reset_index()
+                    .sort_values("total_pnl", ascending=False)
+                )
+                st.subheader("Per-Market P&L Breakdown")
+                fig2 = px.bar(
+                    mkt_summary,
+                    x=market_col,
+                    y="total_pnl",
+                    color="total_pnl",
+                    color_continuous_scale="RdYlGn",
+                    title="Total P&L by Market",
+                    labels={market_col: "Ticker", "total_pnl": "Total P&L"},
+                )
+                st.plotly_chart(fig2, width="stretch")
+            except Exception:
+                pass
 
+# ===========================================================================
+# Tab 5 — Strategy & Backtest
+# ===========================================================================
+
+with tab5:
+    st.subheader("Current Strategy Configuration")
+    config_path = _PROJECT_ROOT / "backtest" / "strategy_config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            cfg = json.load(f)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Vol Estimate", f"{cfg.get('btc_hourly_vol', 0.01):.4f}")
+        c2.metric("Min Edge", f"{cfg.get('min_edge_pp', 8.0):.1f}pp")
+        c3.metric("Kelly Fraction", f"{cfg.get('fractional_kelly', 0.25):.2f}x")
+        c4.metric("Iteration", cfg.get("iteration", 0))
+
+        avoid = cfg.get("avoid_hours", [])
+        if avoid:
+            st.warning(f"Avoiding hours (UTC): {avoid}")
+
+        notes = cfg.get("notes", "")
+        if notes:
+            st.caption(f"Last change: {notes}")
+    else:
+        st.info("No strategy_config.json yet. Run: python scripts/strategy_optimizer.py")
+
+    st.divider()
+    st.subheader("Latest Backtest Results")
+    bt_path = _PROJECT_ROOT / "backtest" / "kxbtc_backtest_results.json"
+    if bt_path.exists():
+        with open(bt_path) as f:
+            bt_data = json.load(f)
+
+        for label_key in [("in_sample", "In-Sample (70%)"), ("out_of_sample", "Out-of-Sample (30%)")]:
+            key, label = label_key
+            seg = bt_data.get(key, {})
+            if seg:
+                st.markdown(f"**{label}**")
+                bc1, bc2, bc3, bc4, bc5 = st.columns(5)
+                bc1.metric("Trades", seg.get("n_trades", 0))
+                bc2.metric("Win Rate", f"{seg.get('win_rate', 0):.1f}%")
+                bc3.metric("Return", f"{seg.get('return_pct', 0):+.1f}%")
+                bc4.metric("Sharpe", f"{seg.get('sharpe', 0):.2f}")
+                bc5.metric("Max DD", f"{seg.get('max_drawdown_pct', 0):.1f}%")
+
+        # Calibration table if available
+        for key in ["in_sample", "out_of_sample"]:
+            seg = bt_data.get(key, {})
+            cal = seg.get("calibration", {})
+            if cal:
+                st.markdown(f"**Calibration ({key.replace('_', ' ').title()})**")
+                cal_rows = []
+                for bucket, data in cal.items():
+                    cal_rows.append({
+                        "FV Bucket": bucket,
+                        "N Trades": data.get("n", 0),
+                        "Avg Fair Value": f"{data.get('avg_fair_value_pct', 0):.1f}%",
+                        "Actual Win Rate": f"{data.get('actual_win_rate_pct', 0):.1f}%",
+                    })
+                if cal_rows:
+                    st.dataframe(pd.DataFrame(cal_rows), width="stretch")
+    else:
+        st.info("No backtest results yet. Run: python scripts/kxbtc_backtest.py --bankroll 10")
+
+    st.divider()
+    st.subheader("Optimization History")
+    opt_log_path = _PROJECT_ROOT / "backtest" / "optimization_log.csv"
+    if opt_log_path.exists():
+        try:
+            opt_df = pd.read_csv(opt_log_path)
+            st.dataframe(opt_df, width="stretch")
+        except Exception:
+            st.warning("Could not read optimization_log.csv")
+    else:
+        st.info("No optimization history yet.")
+
+# ===========================================================================
+# Tab 6 — Loss Postmortem
+# ===========================================================================
+
+with tab6:
+    st.subheader("Loss Postmortem — Round Table Assessment")
+
+    _postmortem_path = _PROJECT_ROOT / "backtest" / "loss_postmortem.json"
+    _postmortem_log_path = _PROJECT_ROOT / "backtest" / "postmortem_log.csv"
+
+    if not _postmortem_path.exists():
+        st.info("No postmortem data yet. Losses must be resolved first.")
+    else:
+        try:
+            with open(_postmortem_path) as _fh:
+                _pm = json.load(_fh)
+
+            # Summary header
+            _pm_ts    = _pm.get("timestamp", "unknown")
+            _pm_n     = _pm.get("n_losses", 0)
+            _pm_top   = _pm.get("top_finding", "N/A")
+            _pm_action = _pm.get("action_taken", "N/A")
+
+            col_a, col_b = st.columns(2)
+            col_a.metric("Losses Analyzed", _pm_n)
+            col_b.metric("Report Date", _pm_ts[:10] if len(_pm_ts) >= 10 else _pm_ts)
+
+            st.markdown(f"**Top Finding:** {_pm_top}")
+            st.markdown(f"**Action Taken:** {_pm_action}")
+
+            st.divider()
+
+            # 5 specialist expandable sections
+            _SPECIALIST_LABELS = [
+                ("vol_analyst",     "Vol Analyst",         "Volatility analysis of losing trades"),
+                ("timing_analyst",  "Timing Analyst",      "Entry timing and time-bucket analysis"),
+                ("market_intel",    "Market Intelligence", "Fair value vs. market pricing on losses"),
+                ("pattern_matcher", "Pattern Matcher",     "Loss clusters by strategy and direction"),
+                ("counterfactual",  "Counterfactual",      "Wrong direction and missed opportunity analysis"),
+            ]
+
+            for _key, _label, _desc in _SPECIALIST_LABELS:
+                _spec = _pm.get(_key, {})
+                if not _spec:
+                    continue
+                with st.expander(f"{_label} — {_spec.get('summary', _desc)}", expanded=False):
+                    _display = {k: v for k, v in _spec.items() if k not in ("specialist", "summary")}
+                    for _k, _v in _display.items():
+                        if isinstance(_v, list):
+                            st.markdown(f"**{_k}:**")
+                            if _v:
+                                st.dataframe(pd.DataFrame(_v))
+                            else:
+                                st.caption("(empty)")
+                        else:
+                            st.markdown(f"**{_k}:** {_v}")
+
+            st.divider()
+
+        except Exception as _pm_err:
+            st.error(f"Could not load postmortem report: {_pm_err}")
+
+    # Postmortem history log
+    st.subheader("Postmortem History")
+    if _postmortem_log_path.exists():
+        try:
+            _pm_log = pd.read_csv(_postmortem_log_path)
+            st.dataframe(_pm_log, use_container_width=True)
+        except Exception:
+            st.warning("Could not read postmortem_log.csv")
+    else:
+        st.caption("No postmortem history yet.")
 
 # ---------------------------------------------------------------------------
-# Main: render tabs
+# Auto-refresh (sleep then st.rerun — blocks the Python thread for 30s)
 # ---------------------------------------------------------------------------
-
-def main() -> None:
-    render_sidebar()
-
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "Trade Lifecycle",
-        "Strategy Performance",
-        "Calibration",
-        "Correlation Map",
-        "Live Positions",
-    ])
-
-    with tab1:
-        tab_trade_lifecycle()
-
-    with tab2:
-        tab_strategy_performance()
-
-    with tab3:
-        tab_calibration()
-
-    with tab4:
-        tab_correlation_map()
-
-    with tab5:
-        tab_live_positions()
-
-
-if __name__ == "__main__":
-    main()
+if auto:
+    time.sleep(30)
+    st.rerun()

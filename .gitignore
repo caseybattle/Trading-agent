@@ -40,3 +40,6 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
+*.pem
+private_key*
+logs/
