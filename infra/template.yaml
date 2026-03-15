@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Prediction Market Trading Bot — serverless deployment.
+  Runs Kalshi BTC range market trader, auto-resolver, and strategy optimizer
+  on scheduled EventBridge rules with S3-backed persistent storage.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  KalshiSecretArn:
+    Type: String
+    Description: >
+      ARN of the Secrets Manager secret containing KALSHI_API_KEY_ID and
+      KALSHI_PRIVATE_KEY (PEM text).
+
+  DefaultBankroll:
+    Type: String
+    Default: "10"
+    Description: Default bankroll in USD passed to the trader.
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+Globals:
+  Function:
+    Runtime: python3.11
+    MemorySize: 512
+    Timeout: 300  # 5 minutes
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        DATA_BUCKET: !Ref DataBucket
+        KALSHI_SECRET_ARN: !Ref KalshiSecretArn
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # -------------------------------------------------------------------------
+  # S3 bucket for trades/, backtest/, data/ persistence
+  # -------------------------------------------------------------------------
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-data-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # -------------------------------------------------------------------------
+  # Lambda function — single function, event-driven dispatch
+  # -------------------------------------------------------------------------
+  TradingBotFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-bot"
+      Description: Prediction market trading bot — unified Lambda handler
+      CodeUri: ../scripts/
+      Handler: lambda_handler.handler
+      Layers:
+        - !Ref DependenciesLayer
+      Policies:
+        # S3 read/write for data persistence
+        - S3CrudPolicy:
+            BucketName: !Ref DataBucket
+        # Secrets Manager read for Kalshi credentials
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref KalshiSecretArn
+        # CloudWatch Logs (auto-granted by SAM, explicit for clarity)
+        - CloudWatchLogsFullAccess
+      Events:
+        # Morning scan: 9 AM EST = 14:00 UTC
+        MorningScan:
+          Type: Schedule
+          Properties:
+            Schedule: "cron(0 14 * * ? *)"
+            Description: "Morning scan — 9 AM EST daily"
+            Input: !Sub '{"action": "morning_scan", "bankroll": "${DefaultBankroll}"}'
+            Enabled: true
+
+        # Active monitor: every 30 minutes (handler checks 11AM-9PM EST window)
+        ActiveMonitor:
+          Type: Schedule
+          Properties:
+            Schedule: "rate(30 minutes)"
+            Description: "Active monitor — every 30 min, 11AM-9PM EST"
+            Input: !Sub '{"action": "active_monitor", "bankroll": "${DefaultBankroll}"}'
+            Enabled: true
+
+        # Expiry intensive: every 15 minutes (handler checks 1PM-6PM EST window)
+        ExpiryIntensive:
+          Type: Schedule
+          Properties:
+            Schedule: "rate(15 minutes)"
+            Description: "Expiry intensive — every 15 min, 1PM-6PM EST"
+            Input: !Sub '{"action": "expiry_intensive", "bankroll": "${DefaultBankroll}"}'
+            Enabled: true
+
+        # Auto-resolver: every 30 minutes
+        AutoResolver:
+          Type: Schedule
+          Properties:
+            Schedule: "rate(30 minutes)"
+            Description: "Auto-resolve settled trades — every 30 min"
+            Input: '{"action": "auto_resolve"}'
+            Enabled: true
+
+        # Optimizer: 10 PM EST = 03:00 UTC next day
+        Optimizer:
+          Type: Schedule
+          Properties:
+            Schedule: "cron(0 3 * * ? *)"
+            Description: "Strategy optimizer — 10 PM EST daily"
+            Input: '{"action": "optimize"}'
+            Enabled: true
+
+  # -------------------------------------------------------------------------
+  # Dependencies layer (pip install into a layer to keep deploy size small)
+  # -------------------------------------------------------------------------
+  DependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${AWS::StackName}-deps"
+      Description: Python dependencies for the trading bot
+      ContentUri: ../layers/dependencies/
+      CompatibleRuntimes:
+        - python3.11
+    Metadata:
+      BuildMethod: python3.11
+
+  # -------------------------------------------------------------------------
+  # CloudWatch alarm — notify on Lambda errors
+  # -------------------------------------------------------------------------
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-errors"
+      AlarmDescription: "Trading bot Lambda errors in the last 5 minutes"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TradingBotFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  FunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt TradingBotFunction.Arn
+
+  DataBucketName:
+    Description: S3 bucket for persistent data
+    Value: !Ref DataBucket
+
+  DataBucketArn:
+    Description: S3 bucket ARN
+    Value: !GetAtt DataBucket.Arn

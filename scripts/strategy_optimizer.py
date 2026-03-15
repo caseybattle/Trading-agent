@@ -747,6 +747,23 @@ def run_optimization(dry_run: bool = False) -> Dict:
 
 
 # ---------------------------------------------------------------------------
+# Parameter bounds (used by skill_evolver.py)
+# ---------------------------------------------------------------------------
+
+def get_config_bounds():
+    """Return valid parameter ranges for the evolver."""
+    return {
+        "btc_hourly_vol": (0.005, 0.025),
+        "min_edge_pp": (3.0, 15.0),
+        "fractional_kelly": (0.10, 0.50),
+        "max_position_pct": (0.02, 0.10),
+        "time_decay_threshold_min": (10, 120),
+        "time_decay_min_fair": (0.50, 0.95),
+        "avoid_hours": "list_of_ints_0_23",
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 

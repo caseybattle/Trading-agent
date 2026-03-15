@@ -81,9 +81,9 @@
     "cases": [
       {
         "name": "complementary_arbitrage_detected",
-        "description": "market_a at 0.80, market_b at 0.80 — complement check: |0.80 - (1-0.80)| = 0.60 > threshold",
+        "description": "market_a at 0.80, market_b at 0.40 — implied_gap = min(|0.80-0.40|=0.40, |0.80-0.60|=0.20) = 0.20 > threshold",
         "input": {
-          "live_prices": {"market_a": 0.80, "market_b": 0.80},
+          "live_prices": {"market_a": 0.80, "market_b": 0.40},
           "graph": "__setup__.graph",
           "threshold": 0.15
         },
@@ -114,9 +114,9 @@
       },
       {
         "name": "low_correlation_below_threshold",
-        "description": "Price gap exists but corr=0.30 produces weak signal_strength < threshold effect",
+        "description": "market_c=0.80, market_d=0.40 — implied_gap=0.20, signal_strength=0.30*0.20=0.06 (weak)",
         "input": {
-          "live_prices": {"market_c": 0.80, "market_d": 0.80},
+          "live_prices": {"market_c": 0.80, "market_d": 0.40},
           "graph": "__setup__.graph",
           "threshold": 0.15
         },
