@@ -386,7 +386,7 @@ def portfolio_kelly_check(candidate_market_id: str,
     }
 
     # ── 4. Total correlation-adjusted exposure ───────────────────────────────
-    total_exposure = sum(abs(f) for f in open_positions.values())
+    total_exposure = round(sum(abs(f) for f in open_positions.values()), 10)
     checks["total_exposure"] = {
         "current": round(total_exposure, 4),
         "limit":   rules["max_total_exposure"],
