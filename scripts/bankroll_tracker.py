@@ -30,6 +30,8 @@ from typing import Optional
 
 import pandas as pd
 
+from storage_backend import get_storage
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -59,6 +61,9 @@ LEDGER_DTYPES: dict[str, str] = {
     "resolved_at": "datetime64[ns, UTC]",
 }
 
+# Storage backend (auto-detects LocalStorage vs S3Storage)
+_storage = get_storage()
+
 _EMPTY_BANKROLL: dict = {
     "starting_bankroll": 0.0,
     "current_bankroll": 0.0,
@@ -83,25 +88,22 @@ def _now_iso() -> str:
 
 
 def _load_bankroll() -> dict:
-    if not BANKROLL_FILE.exists():
+    if not _storage.exists("trades/bankroll.json"):
         raise FileNotFoundError(
-            f"{BANKROLL_FILE} not found. Run `init --bankroll <amount>` first."
+            "trades/bankroll.json not found. Run `init --bankroll <amount>` first."
         )
-    with BANKROLL_FILE.open() as fh:
-        return json.load(fh)
+    return _storage.read_json("trades/bankroll.json")
 
 
 def _save_bankroll(state: dict) -> None:
-    TRADES_DIR.mkdir(parents=True, exist_ok=True)
     state["last_updated"] = _now_iso()
-    with BANKROLL_FILE.open("w") as fh:
-        json.dump(state, fh, indent=2)
+    _storage.write_json("trades/bankroll.json", state)
 
 
 def _load_ledger() -> pd.DataFrame:
-    if not LEDGER_FILE.exists():
+    if not _storage.exists("trades/live_trades.parquet"):
         return _empty_ledger()
-    df = pd.read_parquet(LEDGER_FILE)
+    df = _storage.read_parquet("trades/live_trades.parquet")
     # Ensure all expected columns exist (forward-compat)
     for col in LEDGER_DTYPES:
         if col not in df.columns:
@@ -110,8 +112,7 @@ def _load_ledger() -> pd.DataFrame:
 
 
 def _save_ledger(df: pd.DataFrame) -> None:
-    TRADES_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(LEDGER_FILE, index=False)
+    _storage.write_parquet("trades/live_trades.parquet", df)
 
 
 def _empty_ledger() -> pd.DataFrame:
@@ -180,8 +181,7 @@ class BankrollTracker:
 # ---------------------------------------------------------------------------
 
 def cmd_init(args: argparse.Namespace) -> None:
-    TRADES_DIR.mkdir(parents=True, exist_ok=True)
-    if BANKROLL_FILE.exists():
+    if _storage.exists("trades/bankroll.json"):
         ans = input(
             f"bankroll.json already exists. Overwrite? [y/N] "
         ).strip().lower()
@@ -195,7 +195,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     state["daily_pnl_date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     _save_bankroll(state)
     # Initialise empty ledger if needed
-    if not LEDGER_FILE.exists():
+    if not _storage.exists("trades/live_trades.parquet"):
         _save_ledger(_empty_ledger())
     print(f"Initialised bankroll at ${args.bankroll:.2f}")
     print(f"  bankroll.json -> {BANKROLL_FILE}")

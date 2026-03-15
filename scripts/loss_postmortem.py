@@ -14,15 +14,15 @@ Usage:
 """
 
 import argparse
-import csv
 import json
 import math
 import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Dict, List, Optional
+
+from storage_backend import get_storage
 
 # ---------------------------------------------------------------------------
 # Paths — all relative to project root regardless of CWD
@@ -30,9 +30,8 @@ from typing import Dict, List, Optional
 _SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = _SCRIPT_DIR.parent
 
-BACKTEST_DIR         = PROJECT_ROOT / "backtest"
-POSTMORTEM_JSON      = BACKTEST_DIR / "loss_postmortem.json"
-POSTMORTEM_LOG_CSV   = BACKTEST_DIR / "postmortem_log.csv"
+# Initialize storage backend
+_storage = get_storage()
 
 # BTC vol constant (1% per hour, same as kalshi_btc_trader.py)
 BTC_HOURLY_VOL = 0.01
@@ -597,8 +596,6 @@ def _append_postmortem_log(
     if dry_run:
         return
 
-    BACKTEST_DIR.mkdir(parents=True, exist_ok=True)
-
     vol     = findings.get("vol_analyst",     {})
     intel   = findings.get("market_intel",    {})
     pattern = findings.get("pattern_matcher", {})
@@ -614,12 +611,7 @@ def _append_postmortem_log(
         "wrong_direction_pct": counter.get("wrong_direction_pct", 0.0),
     }
 
-    write_header = not POSTMORTEM_LOG_CSV.exists()
-    with open(POSTMORTEM_LOG_CSV, "a", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=POSTMORTEM_LOG_COLS)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+    _storage.append_csv("backtest/postmortem_log.csv", row, fieldnames=POSTMORTEM_LOG_COLS)
 
 
 # ---------------------------------------------------------------------------
@@ -718,10 +710,8 @@ def run_postmortem(dry_run: bool = False) -> Dict:
     # 6. Write postmortem JSON
     # -----------------------------------------------------------------------
     if not dry_run:
-        BACKTEST_DIR.mkdir(parents=True, exist_ok=True)
-        with open(POSTMORTEM_JSON, "w") as fh:
-            json.dump(merged, fh, indent=2, default=str)
-        print(f"[postmortem] Report written to {POSTMORTEM_JSON}")
+        _storage.write_json("backtest/loss_postmortem.json", merged)
+        print(f"[postmortem] Report written to backtest/loss_postmortem.json")
 
     # -----------------------------------------------------------------------
     # 7. Append to postmortem log CSV

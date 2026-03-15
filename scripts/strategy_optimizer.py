@@ -28,20 +28,20 @@ import os
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# Paths -- all relative to project root regardless of CWD
-# ---------------------------------------------------------------------------
-_SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = _SCRIPT_DIR.parent
+# Storage backend abstraction (Windows LocalStorage / AWS Lambda S3Storage)
+from storage_backend import get_storage
+_storage = get_storage()
 
-SIGNALS_LOG   = PROJECT_ROOT / "trades" / "signals_log.csv"
-CONFIG_PATH   = PROJECT_ROOT / "backtest" / "strategy_config.json"
-OPT_LOG_PATH  = PROJECT_ROOT / "backtest" / "optimization_log.csv"
+# ---------------------------------------------------------------------------
+# Path string constants for display/logging only; actual I/O uses _storage abstraction
+# ---------------------------------------------------------------------------
+SIGNALS_LOG   = "trades/signals_log.csv"
+CONFIG_PATH   = "backtest/strategy_config.json"
+OPT_LOG_PATH  = "backtest/optimization_log.csv"
 
 # ---------------------------------------------------------------------------
 # Default config -- written on first run if config file is absent
@@ -77,18 +77,17 @@ CALIB_BUCKETS = [
 # ---------------------------------------------------------------------------
 
 def _ensure_dirs() -> None:
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SIGNALS_LOG.parent.mkdir(parents=True, exist_ok=True)
+    # Storage backend handles directory creation via write operations
+    pass
 
 
 def load_config() -> Dict:
     """Load strategy_config.json; create with defaults if missing."""
     _ensure_dirs()
-    if not CONFIG_PATH.exists():
+    if not _storage.exists("backtest/strategy_config.json"):
         save_config(DEFAULT_CONFIG)
         return dict(DEFAULT_CONFIG)
-    with open(CONFIG_PATH, "r") as f:
-        cfg = json.load(f)
+    cfg = _storage.read_json("backtest/strategy_config.json")
     # Back-fill any keys added after initial creation
     for k, v in DEFAULT_CONFIG.items():
         cfg.setdefault(k, v)
@@ -96,11 +95,10 @@ def load_config() -> Dict:
 
 
 def save_config(cfg: Dict) -> None:
-    """Persist config to disk."""
+    """Persist config to disk using storage backend."""
     _ensure_dirs()
     cfg["last_updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(cfg, f, indent=2)
+    _storage.write_json("backtest/strategy_config.json", cfg)
 
 
 def reset_config() -> Dict:
@@ -144,13 +142,26 @@ def load_resolved_trades() -> List[Dict]:
         minutes_to_close-> minutes_left
         limit_price     -> market_ask (preferred over market_mid)
     """
-    if not SIGNALS_LOG.exists():
+    if not _storage.exists("trades/signals_log.csv"):
         return []
 
     resolved: List[Dict] = []
 
-    with open(SIGNALS_LOG, "r", newline="") as f:
-        raw_lines = f.readlines()
+    rows = _storage.read_csv("trades/signals_log.csv")
+    if not rows:
+        return []
+
+    # Convert list of dicts (from read_csv) back to raw CSV lines for compatibility
+    raw_lines = []
+    if rows:
+        # Add header from first row's keys
+        header_keys = list(rows[0].keys())
+        raw_lines.append(",".join(header_keys) + "\n")
+
+        # Add data rows
+        for row in rows:
+            values = [str(row.get(k, "")).replace(",", " ") for k in header_keys]
+            raw_lines.append(",".join(values) + "\n")
 
     if not raw_lines:
         return []
@@ -518,25 +529,22 @@ def append_optimization_log(
     n_trades: int,
     change_made: str,
 ) -> None:
-    """Append one row to backtest/optimization_log.csv."""
+    """Append one row to backtest/optimization_log.csv using storage backend."""
     _ensure_dirs()
-    write_header = not OPT_LOG_PATH.exists()
-    with open(OPT_LOG_PATH, "a", newline="") as f:
-        writer = csv.writer(f)
-        if write_header:
-            writer.writerow([
-                "timestamp", "iteration", "btc_hourly_vol",
-                "min_edge_pp", "win_rate", "n_trades", "change_made",
-            ])
-        writer.writerow([
-            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            iteration,
-            f"{vol:.5f}",
-            f"{min_edge:.2f}",
-            f"{win_rate:.4f}",
-            n_trades,
-            change_made,
-        ])
+    fieldnames = [
+        "timestamp", "iteration", "btc_hourly_vol",
+        "min_edge_pp", "win_rate", "n_trades", "change_made",
+    ]
+    row = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "iteration": iteration,
+        "btc_hourly_vol": f"{vol:.5f}",
+        "min_edge_pp": f"{min_edge:.2f}",
+        "win_rate": f"{win_rate:.4f}",
+        "n_trades": n_trades,
+        "change_made": change_made,
+    }
+    _storage.append_csv("backtest/optimization_log.csv", row, fieldnames=fieldnames)
 
 
 # ---------------------------------------------------------------------------

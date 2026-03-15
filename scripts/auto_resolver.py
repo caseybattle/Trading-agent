@@ -42,6 +42,10 @@ load_dotenv(_ENV_FILE)
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
+# Storage backend abstraction (Windows LocalStorage / AWS Lambda S3Storage)
+from storage_backend import get_storage
+_storage = get_storage()
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -49,9 +53,8 @@ KALSHI_BASE_URL = "https://api.elections.kalshi.com"
 KALSHI_KEY_ID = os.getenv("KALSHI_API_KEY_ID", "")
 KALSHI_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
 
-TRADES_DIR = _REPO_ROOT / "trades"
-LEDGER_FILE = TRADES_DIR / "live_trades.parquet"
-SIGNALS_LOG_FILE = TRADES_DIR / "signals_log.csv"
+LEDGER_FILE = "trades/live_trades.parquet"  # StorageBackend handles directory creation
+SIGNALS_LOG_FILE = "trades/signals_log.csv"  # StorageBackend handles directory creation
 
 WATCH_INTERVAL_SECONDS = 300  # 5 minutes
 
@@ -193,14 +196,13 @@ def determine_outcome(direction: str, market_result: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def _load_ledger() -> pd.DataFrame:
-    if not LEDGER_FILE.exists():
+    if not _storage.exists("trades/live_trades.parquet"):
         return pd.DataFrame()
-    return pd.read_parquet(LEDGER_FILE)
+    return _storage.read_parquet("trades/live_trades.parquet")
 
 
 def _save_ledger(df: pd.DataFrame) -> None:
-    TRADES_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(LEDGER_FILE, index=False)
+    _storage.write_parquet("trades/live_trades.parquet", df)
 
 
 def _compute_pnl(direction: str, entry_price: float, contracts: int, outcome: str) -> float:
@@ -246,23 +248,21 @@ def update_signals_log(ticker: str, outcome: str) -> bool:
 
     Returns True if at least one row was updated.
     """
-    if not SIGNALS_LOG_FILE.exists():
+    if not _storage.exists("trades/signals_log.csv"):
         return False
-
-    # Read raw lines to preserve structure
-    with SIGNALS_LOG_FILE.open(newline="", encoding="utf-8") as fh:
-        raw = fh.read()
 
     try:
-        reader = csv.DictReader(io.StringIO(raw))
-        fieldnames = reader.fieldnames
-        if not fieldnames:
+        rows = _storage.read_csv("trades/signals_log.csv")
+        if not rows:
             return False
-
-        rows = list(reader)
     except Exception as exc:
-        print(f"  [WARN] Could not parse signals_log.csv: {exc}")
+        print(f"  [WARN] Could not read signals_log.csv: {exc}")
         return False
+
+    # Determine fieldnames from first row
+    if not rows:
+        return False
+    fieldnames = list(rows[0].keys())
 
     if "outcome" not in fieldnames:
         # No outcome column — nothing to update
@@ -279,10 +279,11 @@ def update_signals_log(ticker: str, outcome: str) -> bool:
     if not updated:
         return False
 
-    with SIGNALS_LOG_FILE.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    try:
+        _storage.write_csv("trades/signals_log.csv", rows, fieldnames)
+    except Exception as exc:
+        print(f"  [WARN] Could not write signals_log.csv: {exc}")
+        return False
 
     return True
 
@@ -315,7 +316,7 @@ def run_once() -> int:
     # ------------------------------------------------------------------
     # 1. Load open trades
     # ------------------------------------------------------------------
-    if not LEDGER_FILE.exists():
+    if not _storage.exists("trades/live_trades.parquet"):
         print("No open trades to check (live_trades.parquet not found).")
         return 0
 
@@ -398,11 +399,8 @@ def run_once() -> int:
                         import bankroll_tracker as bt
                         state = bt.BankrollTracker().get_state()
                         state["current_bankroll"] = round(state["current_bankroll"] + cost, 2)
-                        # Save bankroll
-                        import json
-                        bankroll_path = Path(__file__).resolve().parent.parent / "trades" / "bankroll.json"
-                        with open(bankroll_path, "w") as f:
-                            json.dump(state, f, indent=2)
+                        # Save bankroll using storage backend (Windows/AWS compatible)
+                        _storage.write_json("trades/bankroll.json", state)
 
                         update_signals_log(ticker, "VOIDED")
                         print(f"  [VOID] Refunded ${cost:.4f} to bankroll")

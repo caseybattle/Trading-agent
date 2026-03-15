@@ -23,6 +23,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from storage_backend import get_storage
+
 # ---------------------------------------------------------------------------
 # Optional Plotly (degrade gracefully)
 # ---------------------------------------------------------------------------
@@ -40,21 +42,19 @@ KALSHI_BASE    = "https://api.elections.kalshi.com/trade-api/v2"
 
 # Resolve all file paths relative to project root, not CWD
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_storage = get_storage()
 
 
 def _load_config_params():
     """Load model params from strategy_config.json if available."""
-    cfg_path = _PROJECT_ROOT / "backtest" / "strategy_config.json"
-    if cfg_path.exists():
-        try:
-            with open(cfg_path) as f:
-                cfg = json.load(f)
-            return (
-                cfg.get("btc_hourly_vol", 0.01),
-                cfg.get("min_edge_pp", 8.0) / 100.0,
-            )
-        except Exception:
-            pass
+    try:
+        cfg = _storage.read_json("backtest/strategy_config.json")
+        return (
+            cfg.get("btc_hourly_vol", 0.01),
+            cfg.get("min_edge_pp", 8.0) / 100.0,
+        )
+    except Exception:
+        pass
     return (0.01, 0.08)
 
 
@@ -166,23 +166,20 @@ def get_btc_markets() -> list[dict]:
 
 def load_bankroll() -> tuple[float, float]:
     """Returns (current_bankroll, starting_bankroll)."""
-    if BANKROLL_FILE.exists():
-        try:
-            with open(BANKROLL_FILE) as f:
-                data = json.load(f)
-            current  = float(data.get("current",  data.get("bankroll", 10.0)))
-            starting = float(data.get("starting", data.get("start",    current)))
-            return current, starting
-        except Exception:
-            pass
+    try:
+        data = _storage.read_json("trades/bankroll.json")
+        current  = float(data.get("current",  data.get("bankroll", 10.0)))
+        starting = float(data.get("starting", data.get("start",    current)))
+        return current, starting
+    except Exception:
+        pass
     return 10.0, 10.0
 
 
 def load_signal_log() -> pd.DataFrame:
-    if not SIGNAL_LOG.exists():
-        return pd.DataFrame()
     try:
-        df = pd.read_csv(SIGNAL_LOG)
+        rows = _storage.read_csv("trades/signals_log.csv")
+        df = pd.DataFrame(rows)
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"])
             df = df.sort_values("timestamp", ascending=False)
@@ -192,10 +189,8 @@ def load_signal_log() -> pd.DataFrame:
 
 
 def load_live_trades() -> pd.DataFrame:
-    if not TRADES_FILE.exists():
-        return pd.DataFrame()
     try:
-        return pd.read_parquet(TRADES_FILE)
+        return _storage.read_parquet("trades/live_trades.parquet")
     except Exception:
         return pd.DataFrame()
 
@@ -676,10 +671,8 @@ with tab4:
 
 with tab5:
     st.subheader("Current Strategy Configuration")
-    config_path = _PROJECT_ROOT / "backtest" / "strategy_config.json"
-    if config_path.exists():
-        with open(config_path) as f:
-            cfg = json.load(f)
+    try:
+        cfg = _storage.read_json("backtest/strategy_config.json")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Vol Estimate", f"{cfg.get('btc_hourly_vol', 0.01):.4f}")
         c2.metric("Min Edge", f"{cfg.get('min_edge_pp', 8.0):.1f}pp")
@@ -693,15 +686,13 @@ with tab5:
         notes = cfg.get("notes", "")
         if notes:
             st.caption(f"Last change: {notes}")
-    else:
+    except Exception:
         st.info("No strategy_config.json yet. Run: python scripts/strategy_optimizer.py")
 
     st.divider()
     st.subheader("Latest Backtest Results")
-    bt_path = _PROJECT_ROOT / "backtest" / "kxbtc_backtest_results.json"
-    if bt_path.exists():
-        with open(bt_path) as f:
-            bt_data = json.load(f)
+    try:
+        bt_data = _storage.read_json("backtest/kxbtc_backtest_results.json")
 
         for label_key in [("in_sample", "In-Sample (70%)"), ("out_of_sample", "Out-of-Sample (30%)")]:
             key, label = label_key
@@ -731,19 +722,15 @@ with tab5:
                     })
                 if cal_rows:
                     st.dataframe(pd.DataFrame(cal_rows), width="stretch")
-    else:
+    except Exception:
         st.info("No backtest results yet. Run: python scripts/kxbtc_backtest.py --bankroll 10")
 
     st.divider()
     st.subheader("Optimization History")
-    opt_log_path = _PROJECT_ROOT / "backtest" / "optimization_log.csv"
-    if opt_log_path.exists():
-        try:
-            opt_df = pd.read_csv(opt_log_path)
-            st.dataframe(opt_df, width="stretch")
-        except Exception:
-            st.warning("Could not read optimization_log.csv")
-    else:
+    try:
+        opt_df = _storage.read_csv("backtest/optimization_log.csv")
+        st.dataframe(opt_df, width="stretch")
+    except Exception:
         st.info("No optimization history yet.")
 
 # ===========================================================================
@@ -753,70 +740,62 @@ with tab5:
 with tab6:
     st.subheader("Loss Postmortem — Round Table Assessment")
 
-    _postmortem_path = _PROJECT_ROOT / "backtest" / "loss_postmortem.json"
-    _postmortem_log_path = _PROJECT_ROOT / "backtest" / "postmortem_log.csv"
+    try:
+        _pm = _storage.read_json("backtest/loss_postmortem.json")
 
-    if not _postmortem_path.exists():
-        st.info("No postmortem data yet. Losses must be resolved first.")
-    else:
-        try:
-            with open(_postmortem_path) as _fh:
-                _pm = json.load(_fh)
+        # Summary header
+        _pm_ts    = _pm.get("timestamp", "unknown")
+        _pm_n     = _pm.get("n_losses", 0)
+        _pm_top   = _pm.get("top_finding", "N/A")
+        _pm_action = _pm.get("action_taken", "N/A")
 
-            # Summary header
-            _pm_ts    = _pm.get("timestamp", "unknown")
-            _pm_n     = _pm.get("n_losses", 0)
-            _pm_top   = _pm.get("top_finding", "N/A")
-            _pm_action = _pm.get("action_taken", "N/A")
+        col_a, col_b = st.columns(2)
+        col_a.metric("Losses Analyzed", _pm_n)
+        col_b.metric("Report Date", _pm_ts[:10] if len(_pm_ts) >= 10 else _pm_ts)
 
-            col_a, col_b = st.columns(2)
-            col_a.metric("Losses Analyzed", _pm_n)
-            col_b.metric("Report Date", _pm_ts[:10] if len(_pm_ts) >= 10 else _pm_ts)
+        st.markdown(f"**Top Finding:** {_pm_top}")
+        st.markdown(f"**Action Taken:** {_pm_action}")
 
-            st.markdown(f"**Top Finding:** {_pm_top}")
-            st.markdown(f"**Action Taken:** {_pm_action}")
+        st.divider()
 
-            st.divider()
+        # 5 specialist expandable sections
+        _SPECIALIST_LABELS = [
+            ("vol_analyst",     "Vol Analyst",         "Volatility analysis of losing trades"),
+            ("timing_analyst",  "Timing Analyst",      "Entry timing and time-bucket analysis"),
+            ("market_intel",    "Market Intelligence", "Fair value vs. market pricing on losses"),
+            ("pattern_matcher", "Pattern Matcher",     "Loss clusters by strategy and direction"),
+            ("counterfactual",  "Counterfactual",      "Wrong direction and missed opportunity analysis"),
+        ]
 
-            # 5 specialist expandable sections
-            _SPECIALIST_LABELS = [
-                ("vol_analyst",     "Vol Analyst",         "Volatility analysis of losing trades"),
-                ("timing_analyst",  "Timing Analyst",      "Entry timing and time-bucket analysis"),
-                ("market_intel",    "Market Intelligence", "Fair value vs. market pricing on losses"),
-                ("pattern_matcher", "Pattern Matcher",     "Loss clusters by strategy and direction"),
-                ("counterfactual",  "Counterfactual",      "Wrong direction and missed opportunity analysis"),
-            ]
-
-            for _key, _label, _desc in _SPECIALIST_LABELS:
-                _spec = _pm.get(_key, {})
-                if not _spec:
-                    continue
-                with st.expander(f"{_label} — {_spec.get('summary', _desc)}", expanded=False):
-                    _display = {k: v for k, v in _spec.items() if k not in ("specialist", "summary")}
-                    for _k, _v in _display.items():
-                        if isinstance(_v, list):
-                            st.markdown(f"**{_k}:**")
-                            if _v:
-                                st.dataframe(pd.DataFrame(_v))
-                            else:
-                                st.caption("(empty)")
+        for _key, _label, _desc in _SPECIALIST_LABELS:
+            _spec = _pm.get(_key, {})
+            if not _spec:
+                continue
+            with st.expander(f"{_label} — {_spec.get('summary', _desc)}", expanded=False):
+                _display = {k: v for k, v in _spec.items() if k not in ("specialist", "summary")}
+                for _k, _v in _display.items():
+                    if isinstance(_v, list):
+                        st.markdown(f"**{_k}:**")
+                        if _v:
+                            st.dataframe(pd.DataFrame(_v))
                         else:
-                            st.markdown(f"**{_k}:** {_v}")
+                            st.caption("(empty)")
+                    else:
+                        st.markdown(f"**{_k}:** {_v}")
 
-            st.divider()
+        st.divider()
 
-        except Exception as _pm_err:
-            st.error(f"Could not load postmortem report: {_pm_err}")
+    except FileNotFoundError:
+        st.info("No postmortem data yet. Losses must be resolved first.")
+    except Exception as _pm_err:
+        st.error(f"Could not load postmortem report: {_pm_err}")
 
     # Postmortem history log
     st.subheader("Postmortem History")
-    if _postmortem_log_path.exists():
-        try:
-            _pm_log = pd.read_csv(_postmortem_log_path)
-            st.dataframe(_pm_log, use_container_width=True)
-        except Exception:
-            st.warning("Could not read postmortem_log.csv")
-    else:
+    try:
+        _pm_log = _storage.read_csv("backtest/postmortem_log.csv")
+        st.dataframe(_pm_log, use_container_width=True)
+    except Exception:
         st.caption("No postmortem history yet.")
 
 # ---------------------------------------------------------------------------

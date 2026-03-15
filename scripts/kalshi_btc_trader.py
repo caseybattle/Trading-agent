@@ -40,21 +40,25 @@ try:
 except ImportError:
     _CRYPTO_OK = False
 
+# Storage backend abstraction (local/S3)
+try:
+    from storage_backend import get_storage
+    _storage = get_storage()
+except ImportError:
+    _storage = None
+
 _KALSHI_KEY_ID   = os.getenv("KALSHI_API_KEY_ID", "")
 _KALSHI_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
 
 
 def load_strategy_config() -> dict:
     """Load tuned params from backtest/strategy_config.json if available."""
-    cfg_path = Path(__file__).resolve().parent.parent / "backtest" / "strategy_config.json"
-    if not cfg_path.exists():
-        return {}
     try:
-        import json
-        with open(cfg_path) as f:
-            return json.load(f)
+        if _storage:
+            return _storage.read_json("backtest/strategy_config.json")
     except Exception:
-        return {}
+        pass
+    return {}
 
 
 def _load_private_key():
@@ -158,8 +162,7 @@ MIN_FAIR_VALUE = 0.03       # skip near-zero-probability buckets
 TIME_DECAY_THRESHOLD_MIN = 30  # flag "confirmed in range" if < this minutes
 TIME_DECAY_MIN_FAIR = 0.70    # require model prob ≥ 70% for time-decay plays
 
-SIGNAL_LOG = Path("trades/signals_log.csv")
-SIGNAL_LOG.parent.mkdir(parents=True, exist_ok=True)
+SIGNAL_LOG = "trades/signals_log.csv"  # StorageBackend handles directory creation
 
 CSV_HEADERS = [
     "timestamp",
@@ -316,21 +319,17 @@ def kelly_fraction(fair_value: float, market_price: float) -> float:
 # Daily loss hard stop
 # ---------------------------------------------------------------------------
 DAILY_LOSS_STOP_PCT = 0.03
-BANKROLL_FILE = Path(__file__).resolve().parent.parent / "trades" / "bankroll.json"
 
 def check_daily_loss_stop() -> bool:
     """Return True if daily loss exceeds 3% of starting bankroll."""
-    if not BANKROLL_FILE.exists():
-        return False
     try:
-        import json
-        with open(BANKROLL_FILE) as f:
-            state = json.load(f)
-        starting = state.get("starting_bankroll", 10.0)
-        current = state.get("current_bankroll", starting)
-        loss = starting - current
-        if loss >= starting * DAILY_LOSS_STOP_PCT:
-            return True
+        if _storage:
+            state = _storage.read_json("trades/bankroll.json")
+            starting = state.get("starting_bankroll", 10.0)
+            current = state.get("current_bankroll", starting)
+            loss = starting - current
+            if loss >= starting * DAILY_LOSS_STOP_PCT:
+                return True
     except Exception:
         pass
     return False
@@ -342,14 +341,12 @@ def check_daily_loss_stop() -> bool:
 
 def get_recent_tickers(cooldown_minutes: int = 30) -> set:
     """Return tickers traded within the last cooldown_minutes."""
-    if not SIGNAL_LOG.exists():
-        return set()
     recent = set()
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=cooldown_minutes)
     try:
-        with open(SIGNAL_LOG) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
+        if _storage:
+            rows = _storage.read_csv("trades/signals_log.csv")
+            for row in rows:
                 ts_str = row.get("timestamp", "")
                 ticker = row.get("ticker", "")
                 acted = row.get("acted_on", "")
@@ -371,15 +368,13 @@ def get_recent_tickers(cooldown_minutes: int = 30) -> set:
 
 def get_open_position_tickers() -> set:
     """Return tickers with currently OPEN positions."""
-    ledger_path = Path(__file__).resolve().parent.parent / "trades" / "live_trades.parquet"
-    if not ledger_path.exists():
-        return set()
     try:
-        import pandas as pd
-        df = pd.read_parquet(ledger_path)
-        return set(df[df["status"] == "OPEN"]["ticker"].tolist())
+        if _storage:
+            df = _storage.read_parquet("trades/live_trades.parquet")
+            return set(df[df["status"] == "OPEN"]["ticker"].tolist())
     except Exception:
-        return set()
+        pass
+    return set()
 
 
 # ---------------------------------------------------------------------------
@@ -540,12 +535,11 @@ def log_signal(signal_dict: dict, bankroll: float):
         "outcome":              "",
     }
 
-    write_header = not SIGNAL_LOG.exists()
-    with open(SIGNAL_LOG, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+    try:
+        if _storage:
+            _storage.append_csv("trades/signals_log.csv", row, fieldnames=CSV_HEADERS)
+    except Exception as e:
+        print(f"[WARN] Failed to log signal: {e}")
 
 
 # ---------------------------------------------------------------------------
