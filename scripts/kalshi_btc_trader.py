@@ -622,11 +622,23 @@ def main():
     # File lock to prevent concurrent execution
     LOCK_FILE = Path(__file__).resolve().parent.parent / "trades" / ".trader.lock"
     lock_fh = None
+    _lock_acquired = False
     try:
         LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
         lock_fh = open(LOCK_FILE, "w")
-        import msvcrt
-        msvcrt.locking(lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+        try:
+            import msvcrt
+            msvcrt.locking(lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+            _lock_acquired = True
+        except ImportError:
+            # Linux/macOS — use fcntl instead
+            import fcntl
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_acquired = True
+        except (IOError, OSError):
+            print("  [LOCK] Another trader instance is running. Exiting.")
+            lock_fh.close()
+            sys.exit(0)
     except (IOError, OSError):
         print("  [LOCK] Another trader instance is running. Exiting.")
         sys.exit(0)
@@ -732,4 +744,13 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\n\nStopped. Signal log saved to:", SIGNAL_LOG)
-        sys.exit(0)
+    finally:
+        # Always release the file lock so future runs aren't blocked
+        try:
+            if 'lock_fh' in dir() and lock_fh:
+                lock_fh.close()
+            LOCK_FILE = Path(__file__).resolve().parent.parent / "trades" / ".trader.lock"
+            if LOCK_FILE.exists():
+                LOCK_FILE.unlink()
+        except Exception:
+            pass
