@@ -187,14 +187,29 @@ CSV_HEADERS = [
 # ---------------------------------------------------------------------------
 
 def get_btc_price() -> float:
-    """Fetch live BTC/USD spot price from Coinbase public API."""
-    try:
-        r = requests.get(COINBASE_PRICE_URL, timeout=5)
-        r.raise_for_status()
-        return float(r.json()["data"]["amount"])
-    except Exception as e:
-        print(f"  [WARN] BTC price fetch failed: {e}")
-        return 0.0
+    """Fetch live BTC/USD spot price, trying multiple sources as fallbacks."""
+    sources = [
+        ("Coinbase",   COINBASE_PRICE_URL,
+         lambda r: float(r.json()["data"]["amount"])),
+        ("Binance",    "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
+         lambda r: float(r.json()["price"])),
+        ("Kraken",     "https://api.kraken.com/0/public/Ticker?pair=XBTUSD",
+         lambda r: float(r.json()["result"]["XXBTZUSD"]["c"][0])),
+        ("CoinGecko",  "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
+         lambda r: float(r.json()["bitcoin"]["usd"])),
+    ]
+    for name, url, parse in sources:
+        try:
+            r = requests.get(url, timeout=5)
+            r.raise_for_status()
+            price = parse(r)
+            if price > 0:
+                if name != "Coinbase":
+                    print(f"  [INFO] BTC price from {name}: ${price:,.2f}")
+                return price
+        except Exception as e:
+            print(f"  [WARN] BTC price fetch failed ({name}): {e}")
+    return 0.0
 
 
 def get_btc_range_markets() -> list[dict]:
