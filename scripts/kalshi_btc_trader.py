@@ -155,8 +155,14 @@ FRACTIONAL_KELLY = 0.25
 MAX_POSITION_PCT = 0.05     # 5% of bankroll per trade
 MIN_EDGE_PCT = 0.08         # 8pp minimum edge to signal
 MIN_FAIR_VALUE = 0.03       # skip near-zero-probability buckets
-TIME_DECAY_THRESHOLD_MIN = 30  # flag "confirmed in range" if < this minutes
+# TIME_DECAY: set to 45 min so a 30-min scan interval can catch signals
+# before the window closes. At 30 min threshold + 30 min scan interval,
+# the scanner would often land AFTER the window had already passed.
+TIME_DECAY_THRESHOLD_MIN = 45  # flag "confirmed in range" if < this minutes
 TIME_DECAY_MIN_FAIR = 0.70    # require model prob ≥ 70% for time-decay plays
+# Expiry-mode: lower edge bar for time-decay plays in final 20 min (near-certain)
+TIME_DECAY_EXPIRY_THRESHOLD_MIN = 20  # final-20-min window for relaxed edge
+TIME_DECAY_EXPIRY_MIN_EDGE = 0.05     # 5pp edge floor (vs 8pp) for final-20-min plays
 
 SIGNAL_LOG = Path("trades/signals_log.csv")
 SIGNAL_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -433,9 +439,14 @@ def generate_signals(markets: list[dict], btc_price: float, bankroll: float) -> 
 
         # --- Strategy 1: Time-decay (confirmed in-range, minutes to close) ---
         in_range = m["range_low"] <= btc_price < m["range_high"]
+        expiry_mode = globals().get('_expiry_mode', False)
+        # In expiry-mode, also catch final-20-min plays with a relaxed edge bar
+        _is_final_20 = expiry_mode and m["minutes_left"] <= TIME_DECAY_EXPIRY_THRESHOLD_MIN
+        _td_edge_floor = TIME_DECAY_EXPIRY_MIN_EDGE if _is_final_20 else MIN_EDGE_PCT
+        _strategy_label = "TIME_DECAY_EXPIRY" if _is_final_20 else "TIME_DECAY_IN_RANGE"
         if in_range and m["minutes_left"] <= TIME_DECAY_THRESHOLD_MIN and fair >= TIME_DECAY_MIN_FAIR:
             edge = edge_yes
-            if edge >= MIN_EDGE_PCT:
+            if edge >= _td_edge_floor:
                 kf = kelly_fraction(fair, m["yes_ask"])
                 contracts = max(1, int(bankroll * min(kf, MAX_POSITION_PCT) / m["yes_ask"]))
                 signals.append({
@@ -449,7 +460,7 @@ def generate_signals(markets: list[dict], btc_price: float, bankroll: float) -> 
                     "contracts":        contracts,
                     "limit_price":      m["yes_ask"],
                     "minutes_to_close": m["minutes_left"],
-                    "strategy":         "TIME_DECAY_IN_RANGE",
+                    "strategy":         _strategy_label,
                     "range":            f"${m['range_low']:,}–${m['range_high']:,}",
                 })
 
@@ -650,9 +661,18 @@ def main():
     parser.add_argument("--auto-trade", action="store_true", help="(Future) auto-place orders via Kalshi API")
     parser.add_argument("--min-edge", type=float, default=MIN_EDGE_PCT, help="Min edge to signal (default: 0.08)")
     parser.add_argument("--vol", type=float, default=BTC_HOURLY_VOL_PCT, help="BTC hourly vol fraction (default: 0.01)")
+    parser.add_argument("--expiry-mode", action="store_true",
+                        help="Expiry-intensive mode: widens TIME_DECAY window and relaxes edge for final-20-min plays")
     args = parser.parse_args()
     MIN_EDGE_PCT = args.min_edge
     BTC_HOURLY_VOL_PCT = args.vol
+
+    # Expiry-mode: widen the time-decay window + relax edge bar for near-expiry in-range plays
+    if args.expiry_mode:
+        globals()['_expiry_mode'] = True
+        print("  [MODE] EXPIRY-INTENSIVE — TIME_DECAY window extended, edge relaxed for final-20-min plays")
+    else:
+        globals()['_expiry_mode'] = False
 
     print("=" * 60)
     print("  KALSHI BTC RANGE MARKET TRADER")
@@ -660,6 +680,7 @@ def main():
     print(f"  Poll interval: {args.interval}s")
     print(f"  Min edge: {args.min_edge*100:.0f}pp")
     print(f"  BTC hourly vol: {args.vol*100:.1f}%")
+    print(f"  Expiry mode: {'ON' if args.expiry_mode else 'OFF'}")
     print(f"  Signal log: {SIGNAL_LOG}")
     print("=" * 60)
 
@@ -730,6 +751,25 @@ def main():
             print(f"  On Kalshi, search: {top['ticker']}")
             print(f"  Buy {top['contracts']}x {top['yes_no']} at ${top['limit_price']:.2f} limit")
             print(f"  Cost: ${top['contracts'] * top['limit_price']:.2f}  |  Edge: {top['edge']*100:.1f}pp  |  Strategy: {top['strategy']}")
+
+        # --- Scan frequency recommendation ---
+        # Prints guidance so the Windows Task Scheduler can be tuned appropriately.
+        # Different assets need different frequencies:
+        #   BTC hourly range (KXBTC)  → 15 min during expiry window, 30 min otherwise
+        #   Daily resolution markets  → 30-60 min is sufficient
+        #   Multi-day / weekly        → hourly or less
+        if markets:
+            min_mins_left = min(m["minutes_left"] for m in markets)
+            if min_mins_left <= 20:
+                rec_interval = 10
+                rec_reason = f"market expiring in {min_mins_left:.0f} min — use 10-min scan"
+            elif min_mins_left <= 45:
+                rec_interval = 15
+                rec_reason = f"market expiring in {min_mins_left:.0f} min — use 15-min scan"
+            else:
+                rec_interval = 30
+                rec_reason = "no near-expiry markets — 30-min scan sufficient"
+            print(f"\n  [SCAN_FREQ] Recommended next interval: {rec_interval} min ({rec_reason})")
 
         if args.once:
             print("\n  [--once] Single cycle complete. Exiting.")
