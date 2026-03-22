@@ -50,6 +50,16 @@ except ImportError:
 _KALSHI_KEY_ID   = os.getenv("KALSHI_API_KEY_ID", "")
 _KALSHI_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
 
+# Railway / cloud deployment: key contents supplied as env var instead of file
+_KALSHI_KEY_CONTENTS = os.getenv("KALSHI_PRIVATE_KEY_CONTENTS", "")
+if _KALSHI_KEY_CONTENTS and not _KALSHI_KEY_PATH:
+    import tempfile as _tempfile
+    _tmp_key = _tempfile.NamedTemporaryFile(delete=False, suffix=".pem")
+    _tmp_key.write(_KALSHI_KEY_CONTENTS.encode("utf-8"))
+    _tmp_key.flush()
+    _tmp_key.close()
+    _KALSHI_KEY_PATH = _tmp_key.name
+
 
 def load_strategy_config() -> dict:
     """Load tuned params from backtest/strategy_config.json if available."""
@@ -604,8 +614,12 @@ def main():
     try:
         LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
         lock_fh = open(LOCK_FILE, "w")
-        import msvcrt
-        msvcrt.locking(lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (IOError, OSError):
         print("  [LOCK] Another trader instance is running. Exiting.")
         sys.exit(0)
