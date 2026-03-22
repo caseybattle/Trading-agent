@@ -69,6 +69,10 @@ trades/
 - **CPU parallelization**: `os.cpu_count()` in backtest_runner for parallel strategy evaluation
 - **Data augmentation**: Gaussian noise stress testing in backtest to check robustness
 - **5-specialist postmortem**: Vol Analyst, Timing Analyst, Market Intel, Pattern Matcher, Counterfactual — run in parallel via ThreadPoolExecutor after every resolved loss batch
+- **TIME_DECAY threshold = 45 min** (not 30) — ensures a 30-min scan interval always catches in-range signals before the window closes
+- **Expiry-mode** (`--expiry-mode` flag): final-20-min in-range plays use 5pp edge floor (vs 8pp standard), labeled `TIME_DECAY_EXPIRY` — for the 1–6 PM EST intensive scan task
+- **Scan frequency is asset-dependent**: bot prints `[SCAN_FREQ]` recommendation each cycle (10 min if <20 min to close, 15 min if <45 min, 30 min otherwise)
+- **File lock is cross-platform**: uses `fcntl` on Linux/macOS, `msvcrt` on Windows; always released via `finally` block even on crash — stale locks no longer block future runs
 
 ## Automated Self-Improvement Loop
 ```
@@ -84,11 +88,11 @@ auto_resolver.py resolves settled trades
 - Category max: 15% of bankroll
 - Total correlation-adjusted exposure: 40% max
 - Daily loss hard stop: 3% (checked at top of each scan cycle)
-- Min edge to trade: 8 percentage points (configurable via strategy_config.json)
+- Min edge to trade: 8pp standard; 5pp in expiry-mode final-20-min plays
 - Min liquidity: $5k Kalshi
 - Max slippage: 2% (applied in backtest)
 - Minimum bankroll floor: $0.50 (enforced in bankroll_tracker)
-- File lock: prevents concurrent trader instances (msvcrt on Windows)
+- File lock: cross-platform (fcntl on Linux, msvcrt on Windows); always released in finally block
 - Ticker cooldown: 30-min dedup guard on auto-traded signals
 
 ## Kalshi Authentication
@@ -100,12 +104,15 @@ auto_resolver.py resolves settled trades
 ## Platform APIs
 - **Kalshi markets**: `https://api.elections.kalshi.com/trade-api/v2/markets?series_ticker=KXBTC&status=open`
 - **Kalshi orders**: `POST https://api.elections.kalshi.com/trade-api/v2/portfolio/orders`
-- **BTC price**: `https://api.coinbase.com/v2/prices/BTC-USD/spot`
+- **BTC price** (in priority order, auto-fallback): Coinbase → Binance → Kraken → CoinGecko
 
 ## Running the Bot
 ```bash
 # Live trader (single cycle)
 python scripts/kalshi_btc_trader.py --once --bankroll 10
+
+# Live trader — expiry-intensive mode (final-hour plays, relaxed edge)
+python scripts/kalshi_btc_trader.py --once --bankroll 10 --expiry-mode
 
 # Live trader with auto-trading
 python scripts/kalshi_btc_trader.py --auto-trade --bankroll 10
@@ -127,8 +134,23 @@ python scripts/bankroll_tracker.py status
 ```
 
 ## Scheduled Tasks (Windows Task Scheduler)
-- `kalshi-btc-morning-scan`: daily 9 AM EST — single cycle scan
-- `kalshi-btc-active-monitor`: every 30 min, 11 AM–9 PM EST
-- `kalshi-btc-expiry-intensive`: every 15 min, 1–6 PM EST
+- `kalshi-btc-morning-scan`: daily 9 AM EST — `--once --bankroll 10`
+- `kalshi-btc-active-monitor`: every 30 min, 11 AM–9 PM EST — `--once --bankroll 10`
+- `kalshi-btc-expiry-intensive`: every 15 min, 1–6 PM EST — `--once --bankroll 10 --expiry-mode`  ← ADD --expiry-mode
 - `kxbtc-auto-resolve`: every 30 min, 9 AM–10 PM — resolves + triggers postmortem
 - `kxbtc-strategy-optimizer-daily`: daily 10 PM — standalone optimizer run
+
+## Scan Frequency by Asset Type
+Different assets require different scan cadences — the bot prints `[SCAN_FREQ]` guidance each run:
+| Asset / Situation | Recommended Interval |
+|---|---|
+| KXBTC market < 20 min to close | 10 min |
+| KXBTC market < 45 min to close | 15 min |
+| No near-expiry markets | 30 min |
+| Daily-resolution markets | 30–60 min |
+| Multi-day / weekly markets | 60+ min |
+
+## Known Bugs Fixed (do not reintroduce)
+- **Stale lock file** (Mar 17 2026): crash left `.trader.lock` with no cleanup, silently killed all future runs for 4 days. Fixed: `finally` block always removes lock on exit.
+- **TIME_DECAY dead zone**: 30-min threshold + 30-min scan = signals always expired before acting. Fixed: threshold raised to 45 min.
+- **BTC price single-source failure**: Coinbase block killed all cycles. Fixed: 4-source fallback chain.
