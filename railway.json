@@ -1,0 +1,38 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "deploy": {
+    "numReplicas": 0
+  },
+  "services": {
+    "bot-scanner": {
+      "build": {
+        "builder": "NIXPACKS"
+      },
+      "deploy": {
+        "cronSchedule": "*/30 * * * *",
+        "startCommand": "python scripts/kalshi_btc_trader.py --once --auto-trade"
+      }
+    },
+    "watchdog": {
+      "build": {
+        "builder": "NIXPACKS"
+      },
+      "deploy": {
+        "cronSchedule": "0 8 * * *",
+        "startCommand": "python scripts/watchdog.py"
+      }
+    },
+    "live-optimizer": {
+      "build": {
+        "builder": "NIXPACKS"
+      },
+      "deploy": {
+        "cronSchedule": "0 */6 * * *",
+        "startCommand": "python scripts/live_optimizer.py"
+      }
+    }
+  }
+}
