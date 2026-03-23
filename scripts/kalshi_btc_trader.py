@@ -172,6 +172,22 @@ MIN_FAIR_VALUE = 0.03       # skip near-zero-probability buckets
 TIME_DECAY_THRESHOLD_MIN = 30  # flag "confirmed in range" if < this minutes
 TIME_DECAY_MIN_FAIR = 0.70    # require model prob ≥ 70% for time-decay plays
 
+# --- New filter constants (overridden from strategy_config.json) ---
+MIN_CONTRACT_PRICE = 0.20   # Change 1: longshot bias filter
+MIN_MINUTES_TO_EXPIRY = 30  # Change 2: expiry window floor
+MAX_MINUTES_TO_EXPIRY = 90  # Change 2: expiry window ceiling
+MIN_NET_EDGE_PCT = 0.08     # Change 3: net edge after fees
+BTC_FEE_MULTIPLIER = 0.07   # Change 3: Kalshi BTC taker fee coefficient
+SPX_FEE_MULTIPLIER = 0.035  # Change 4: SPX/Nasdaq 50% discount
+SCAN_SPX = False            # Change 4: scan S&P 500 / Nasdaq markets
+
+# SPX series tickers (prefix match)
+SPX_SERIES = ["INXD", "NASDAQ"]
+
+# Streak sizing bounds (Change 5)
+_STREAK_MAX_MULTIPLIER = 2.0
+_STREAK_MIN_MULTIPLIER = 0.5
+
 SIGNAL_LOG = "trades/signals_log.csv"  # StorageBackend handles directory creation
 
 CSV_HEADERS = [
@@ -240,9 +256,6 @@ def get_btc_range_markets() -> list[dict]:
         ticker = m.get("ticker", "")
 
         # Only range bucket markets: ticker must contain -B<digits> suffix
-        # e.g. KXBTC-26MAR1416-B71250  (hourly, $71,250–$71,500 bucket)
-        #      KXBTC-26MAR2017-B71250  (weekly)
-        # Skip T-suffix threshold markets (e.g. KXBTC-26MAR1416-T62750)
         parts = ticker.split("-B")
         if len(parts) < 2 or not parts[-1].isdigit():
             continue
@@ -262,7 +275,6 @@ def get_btc_range_markets() -> list[dict]:
         if minutes_left < 0:
             continue  # already closed
 
-        # yes_ask_dollars / yes_bid_dollars come back as strings ("0.0500")
         yes_ask = float(m.get("yes_ask_dollars") or 0)
         yes_bid = float(m.get("yes_bid_dollars") or 0)
         volume_24h = float(m.get("volume_24h_fp") or 0)
@@ -280,7 +292,75 @@ def get_btc_range_markets() -> list[dict]:
             "spread": round(yes_ask - yes_bid, 4),
             "volume_24h": volume_24h,
             "minutes_left": round(minutes_left, 2),
+            "fee_multiplier": BTC_FEE_MULTIPLIER,
+            "asset": "BTC",
         })
+
+    return markets
+
+
+def get_spx_markets() -> list[dict]:
+    """
+    Fetch open S&P 500 and Nasdaq range markets from Kalshi.
+    These carry a 50% fee discount vs BTC markets.
+    Scans INXD (S&P 500 daily) and NASDAQ series.
+    """
+    markets = []
+    now = datetime.now(timezone.utc)
+
+    for series in SPX_SERIES:
+        url = f"{KALSHI_BASE}/markets"
+        params = {"status": "open", "limit": 200, "series_ticker": series}
+        try:
+            r = requests.get(url, params=params, headers={"Accept": "application/json"}, timeout=10)
+            r.raise_for_status()
+            raw_markets = r.json().get("markets", [])
+        except Exception as e:
+            print(f"  [WARN] SPX fetch ({series}) failed: {e}")
+            continue
+
+        for m in raw_markets:
+            ticker = m.get("ticker", "")
+            parts = ticker.split("-B")
+            if len(parts) < 2 or not parts[-1].isdigit():
+                continue
+            try:
+                range_low = int(parts[-1])
+            except ValueError:
+                continue
+
+            close_str = m.get("close_time") or m.get("expiration_time", "")
+            try:
+                close_dt = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
+                minutes_left = (close_dt - now).total_seconds() / 60
+            except Exception:
+                minutes_left = 999
+
+            if minutes_left < 0:
+                continue
+
+            yes_ask = float(m.get("yes_ask_dollars") or 0)
+            yes_bid = float(m.get("yes_bid_dollars") or 0)
+            volume_24h = float(m.get("volume_24h_fp") or 0)
+
+            if yes_ask <= 0 or yes_bid <= 0:
+                continue
+
+            bucket_width = int(m.get("bucket_width") or 250)
+
+            markets.append({
+                "ticker": ticker,
+                "range_low": range_low,
+                "range_high": range_low + bucket_width,
+                "yes_ask": yes_ask,
+                "yes_bid": yes_bid,
+                "mid": round((yes_ask + yes_bid) / 2, 4),
+                "spread": round(yes_ask - yes_bid, 4),
+                "volume_24h": volume_24h,
+                "minutes_left": round(minutes_left, 2),
+                "fee_multiplier": SPX_FEE_MULTIPLIER,
+                "asset": series,
+            })
 
     return markets
 
@@ -297,12 +377,10 @@ def compute_fair_value(btc_price: float, range_low: float, range_high: float,
     sigma = hourly_vol_pct * sqrt(hours_left)
     """
     if btc_price <= 0 or hours_left <= 0:
-        # Zero time: check if BTC is in range right now
         return 1.0 if range_low <= btc_price < range_high else 0.0
 
     sigma = hourly_vol_pct * math.sqrt(hours_left)
 
-    # Log-normal bounds
     ln_low = math.log(range_low / btc_price) if range_low > 0 else -np.inf
     ln_high = math.log(range_high / btc_price)
 
@@ -323,6 +401,61 @@ def kelly_fraction(fair_value: float, market_price: float) -> float:
     f_full = (fair_value * b - q) / b
     f_fractional = f_full * FRACTIONAL_KELLY
     return max(0.0, min(0.5, f_fractional))
+
+
+# ---------------------------------------------------------------------------
+# Change 3: Fee-aware edge calculation
+# ---------------------------------------------------------------------------
+
+def compute_net_edge(raw_edge: float, contract_price: float, fee_multiplier: float = BTC_FEE_MULTIPLIER) -> float:
+    """
+    Subtract round-trip taker fee from raw edge.
+
+    Fee per contract = fee_multiplier * price * (1 - price)
+    Fee as fraction of dollar invested = fee_multiplier * (1 - price)
+    Round-trip (entry + exit) = 2 * fee_multiplier * (1 - price)
+
+    At price=0.50, fee_mult=0.07: round-trip = 7pp
+    At price=0.80, fee_mult=0.07: round-trip = 1.4pp
+    At price=0.90, fee_mult=0.07: round-trip = 1.4pp
+    """
+    round_trip_fee = 2 * fee_multiplier * (1 - contract_price)
+    return raw_edge - round_trip_fee
+
+
+# ---------------------------------------------------------------------------
+# Change 5: Streak-based position sizing
+# ---------------------------------------------------------------------------
+
+def get_streak_multiplier() -> float:
+    """
+    Read logs/circuit_state.json for recent win/loss streak.
+    Returns a multiplier to apply to contract count:
+      - 3+ consecutive wins:  +10% per win above 2, capped at 2.0x
+      - 2+ consecutive losses: -20% per loss above 1, floored at 0.5x
+      - Otherwise: 1.0 (neutral)
+
+    circuit_state.json schema:
+      {"consecutive_wins": N, "consecutive_losses": N, "last_updated": "..."}
+    """
+    try:
+        circuit_path = Path(__file__).resolve().parent.parent / "logs" / "circuit_state.json"
+        if not circuit_path.exists():
+            return 1.0
+        import json
+        with open(circuit_path) as f:
+            state = json.load(f)
+        wins = int(state.get("consecutive_wins", 0))
+        losses = int(state.get("consecutive_losses", 0))
+        if wins >= 3:
+            multiplier = 1.0 + 0.10 * (wins - 2)
+            return min(multiplier, _STREAK_MAX_MULTIPLIER)
+        elif losses >= 2:
+            multiplier = 1.0 - 0.20 * (losses - 1)
+            return max(multiplier, _STREAK_MIN_MULTIPLIER)
+        return 1.0
+    except Exception:
+        return 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -391,99 +524,143 @@ def get_open_position_tickers() -> set:
 # Signal generation
 # ---------------------------------------------------------------------------
 
-def generate_signals(markets: list[dict], btc_price: float, bankroll: float) -> list[dict]:
+def generate_signals(markets: list[dict], btc_price: float, bankroll: float,
+                     ref_price: float = 0.0) -> list[dict]:
+    """
+    ref_price: current spot price for the asset (BTC price for BTC markets,
+               index level for SPX/Nasdaq). Falls back to btc_price if 0.
+    """
     current_hour = datetime.now(timezone.utc).hour
     if hasattr(sys.modules[__name__], '_avoid_hours') and current_hour in globals().get('_avoid_hours', set()):
         print(f"  [SKIP] Hour {current_hour} UTC is in avoid_hours list from optimizer")
         return []
 
+    if ref_price <= 0:
+        ref_price = btc_price
+
+    streak_mult = get_streak_multiplier()
     signals = []
 
     for m in markets:
-        hours_left = m["minutes_left"] / 60.0
-        fair = compute_fair_value(btc_price, m["range_low"], m["range_high"], hours_left)
+        minutes_left = m["minutes_left"]
+        fee_mult = m.get("fee_multiplier", BTC_FEE_MULTIPLIER)
+
+        # --- Change 2: Expiry window filter ---
+        if minutes_left < MIN_MINUTES_TO_EXPIRY or minutes_left > MAX_MINUTES_TO_EXPIRY:
+            # Exception: TIME_DECAY strategy is allowed at the 30-min boundary
+            in_range = m["range_low"] <= ref_price < m["range_high"]
+            if not (in_range and minutes_left <= TIME_DECAY_THRESHOLD_MIN):
+                print(f"  [SKIP] {m['ticker']} EXPIRY_WINDOW_FILTER ({minutes_left:.1f}min)")
+                continue
+
+        hours_left = minutes_left / 60.0
+        fair = compute_fair_value(ref_price, m["range_low"], m["range_high"], hours_left)
 
         if fair < MIN_FAIR_VALUE:
             continue
 
         mid = m["mid"]
-        edge_yes = fair - m["yes_ask"]   # edge buying YES
-        edge_no = (1 - fair) - m["yes_bid"] / 1.0  # edge buying NO (= selling YES)
-        # NO edge: fair value of NO = 1-fair, cost of NO = 1 - yes_bid
+        edge_yes = fair - m["yes_ask"]
         no_cost = round(1.0 - m["yes_bid"], 4)
         edge_no_clean = (1 - fair) - no_cost
 
-        # Shared fields included in every signal for logging
         _common = {
             "range_low":          m["range_low"],
             "range_high":         m["range_high"],
             "market_bid":         m["yes_bid"],
             "btc_price_at_signal": btc_price,
+            "fee_multiplier":     fee_mult,
         }
 
         # --- Strategy 1: Time-decay (confirmed in-range, minutes to close) ---
-        in_range = m["range_low"] <= btc_price < m["range_high"]
-        if in_range and m["minutes_left"] <= TIME_DECAY_THRESHOLD_MIN and fair >= TIME_DECAY_MIN_FAIR:
+        in_range = m["range_low"] <= ref_price < m["range_high"]
+        if in_range and minutes_left <= TIME_DECAY_THRESHOLD_MIN and fair >= TIME_DECAY_MIN_FAIR:
+            price = m["yes_ask"]
+            # Change 1: longshot bias filter
+            if price < MIN_CONTRACT_PRICE:
+                print(f"  [SKIP] {m['ticker']} LONGSHOT_BIAS_FILTER YES@{price:.2f}")
+                continue
             edge = edge_yes
-            if edge >= MIN_EDGE_PCT:
-                kf = kelly_fraction(fair, m["yes_ask"])
-                contracts = max(1, int(bankroll * min(kf, MAX_POSITION_PCT) / m["yes_ask"]))
+            # Change 3: fee-adjusted edge
+            net_edge = compute_net_edge(edge, price, fee_mult)
+            if net_edge >= MIN_NET_EDGE_PCT:
+                kf = kelly_fraction(fair, price)
+                raw_contracts = max(1, int(bankroll * min(kf, MAX_POSITION_PCT) / price))
+                contracts = max(1, round(raw_contracts * streak_mult))
                 signals.append({
                     **_common,
                     "ticker":           m["ticker"],
                     "yes_no":           "YES",
                     "fair_value":       round(fair, 4),
                     "market_mid":       mid,
-                    "edge":             round(edge, 4),
+                    "edge":             round(net_edge, 4),
+                    "raw_edge":         round(edge, 4),
                     "kelly_fraction":   round(kf, 4),
                     "contracts":        contracts,
-                    "limit_price":      m["yes_ask"],
-                    "minutes_to_close": m["minutes_left"],
+                    "limit_price":      price,
+                    "minutes_to_close": minutes_left,
                     "strategy":         "TIME_DECAY_IN_RANGE",
                     "range":            f"${m['range_low']:,}–${m['range_high']:,}",
                 })
 
         # --- Strategy 2: Model edge YES (overpriced probability) ---
-        elif edge_yes >= MIN_EDGE_PCT and fair > mid and m["minutes_left"] > 15:
-            kf = kelly_fraction(fair, m["yes_ask"])
-            contracts = max(1, int(bankroll * min(kf, MAX_POSITION_PCT) / m["yes_ask"]))
-            signals.append({
-                **_common,
-                "ticker":           m["ticker"],
-                "yes_no":           "YES",
-                "fair_value":       round(fair, 4),
-                "market_mid":       mid,
-                "edge":             round(edge_yes, 4),
-                "kelly_fraction":   round(kf, 4),
-                "contracts":        contracts,
-                "limit_price":      m["yes_ask"],
-                "minutes_to_close": m["minutes_left"],
-                "strategy":         "MODEL_UNDERPRICED_YES",
-                "range":            f"${m['range_low']:,}–${m['range_high']:,}",
-            })
+        elif edge_yes >= MIN_EDGE_PCT and fair > mid and minutes_left > 15:
+            price = m["yes_ask"]
+            # Change 1: longshot bias filter
+            if price < MIN_CONTRACT_PRICE:
+                print(f"  [SKIP] {m['ticker']} LONGSHOT_BIAS_FILTER YES@{price:.2f}")
+                continue
+            # Change 3: fee-adjusted edge
+            net_edge = compute_net_edge(edge_yes, price, fee_mult)
+            if net_edge >= MIN_NET_EDGE_PCT:
+                kf = kelly_fraction(fair, price)
+                raw_contracts = max(1, int(bankroll * min(kf, MAX_POSITION_PCT) / price))
+                contracts = max(1, round(raw_contracts * streak_mult))
+                signals.append({
+                    **_common,
+                    "ticker":           m["ticker"],
+                    "yes_no":           "YES",
+                    "fair_value":       round(fair, 4),
+                    "market_mid":       mid,
+                    "edge":             round(net_edge, 4),
+                    "raw_edge":         round(edge_yes, 4),
+                    "kelly_fraction":   round(kf, 4),
+                    "contracts":        contracts,
+                    "limit_price":      price,
+                    "minutes_to_close": minutes_left,
+                    "strategy":         "MODEL_UNDERPRICED_YES",
+                    "range":            f"${m['range_low']:,}–${m['range_high']:,}",
+                })
 
         # --- Strategy 3: Model edge NO (market thinks too likely, buy NO) ---
-        elif edge_no_clean >= MIN_EDGE_PCT and (1 - fair) > (1 - mid) and m["minutes_left"] > 15:
+        elif edge_no_clean >= MIN_EDGE_PCT and (1 - fair) > (1 - mid) and minutes_left > 15:
+            # Change 1: longshot bias filter — apply to NO contract price
+            if no_cost < MIN_CONTRACT_PRICE:
+                print(f"  [SKIP] {m['ticker']} LONGSHOT_BIAS_FILTER NO@{no_cost:.2f}")
+                continue
             fair_no = 1 - fair
-            kf = kelly_fraction(fair_no, no_cost)
-            contracts = max(1, int(bankroll * min(kf, MAX_POSITION_PCT) / no_cost))
-            signals.append({
-                **_common,
-                # For NO positions, market_bid from YES perspective is still yes_bid;
-                # the cost to buy NO = no_cost = 1 - yes_bid, so we override limit_price only.
-                "market_bid":       round(no_cost, 4),   # cost of the NO contract
-                "ticker":           m["ticker"],
-                "yes_no":           "NO",
-                "fair_value":       round(fair_no, 4),
-                "market_mid":       round(1 - mid, 4),
-                "edge":             round(edge_no_clean, 4),
-                "kelly_fraction":   round(kf, 4),
-                "contracts":        contracts,
-                "limit_price":      round(no_cost, 4),
-                "minutes_to_close": m["minutes_left"],
-                "strategy":         "MODEL_UNDERPRICED_NO",
-                "range":            f"${m['range_low']:,}–${m['range_high']:,}",
-            })
+            # Change 3: fee-adjusted edge
+            net_edge = compute_net_edge(edge_no_clean, no_cost, fee_mult)
+            if net_edge >= MIN_NET_EDGE_PCT:
+                kf = kelly_fraction(fair_no, no_cost)
+                raw_contracts = max(1, int(bankroll * min(kf, MAX_POSITION_PCT) / no_cost))
+                contracts = max(1, round(raw_contracts * streak_mult))
+                signals.append({
+                    **_common,
+                    "market_bid":       round(no_cost, 4),
+                    "ticker":           m["ticker"],
+                    "yes_no":           "NO",
+                    "fair_value":       round(fair_no, 4),
+                    "market_mid":       round(1 - mid, 4),
+                    "edge":             round(net_edge, 4),
+                    "raw_edge":         round(edge_no_clean, 4),
+                    "kelly_fraction":   round(kf, 4),
+                    "contracts":        contracts,
+                    "limit_price":      round(no_cost, 4),
+                    "minutes_to_close": minutes_left,
+                    "strategy":         "MODEL_UNDERPRICED_NO",
+                    "range":            f"${m['range_low']:,}–${m['range_high']:,}",
+                })
 
     # Sort by edge descending
     signals.sort(key=lambda x: x["edge"], reverse=True)
@@ -497,21 +674,10 @@ def generate_signals(markets: list[dict], btc_price: float, bankroll: float) -> 
 def log_signal(signal_dict: dict, bankroll: float):
     """
     Write one signal row to trades/signals_log.csv.
-
-    Parameters
-    ----------
-    signal_dict : dict
-        A signal produced by generate_signals().  Must contain at least:
-        ticker, strategy, yes_no, range, range_low, range_high,
-        fair_value, limit_price (= market_ask), market_bid,
-        edge, minutes_to_close, btc_price_at_signal.
-    bankroll : float
-        Current bankroll in USD, used to compute recommended_contracts.
     """
     market_ask = signal_dict["limit_price"]
     direction = signal_dict["yes_no"]
 
-    # Fractional Kelly: edge / (1 - market_ask) * FRACTIONAL_KELLY, capped at MAX_POSITION_PCT
     denom = 1.0 - market_ask
     if denom > 0:
         kf = min((signal_dict["edge"] / denom) * FRACTIONAL_KELLY, MAX_POSITION_PCT)
@@ -519,7 +685,6 @@ def log_signal(signal_dict: dict, bankroll: float):
         kf = 0.0
     kf = max(0.0, round(kf, 6))
 
-    # recommended_contracts = kelly_fraction * bankroll / market_ask, min 1
     if market_ask > 0 and bankroll > 0:
         rec_contracts = max(1, round(kf * bankroll / market_ask))
     else:
@@ -560,9 +725,10 @@ def print_market_table(markets: list[dict], btc_price: float):
     print(f"\n  {'TICKER':<35} {'RANGE':>22}  {'MID':>5}  {'SPREAD':>6}  {'MIN_LEFT':>8}  {'24H_VOL':>10}  {'FAIR':>5}  {'EDGE':>6}")
     print("  " + "-" * 115)
     for m in sorted(markets, key=lambda x: x["minutes_left"])[:20]:
-        fair = compute_fair_value(btc_price, m["range_low"], m["range_high"], m["minutes_left"] / 60)
+        ref = btc_price
+        fair = compute_fair_value(ref, m["range_low"], m["range_high"], m["minutes_left"] / 60)
         edge = fair - m["yes_ask"]
-        in_range = m["range_low"] <= btc_price < m["range_high"]
+        in_range = m["range_low"] <= ref < m["range_high"]
         flag = " <-- IN RANGE" if in_range else ""
         print(f"  {m['ticker']:<35} ${m['range_low']:>7,}–${m['range_high']:<7,}  {m['mid']:>5.2f}  {m['spread']:>6.2f}  {m['minutes_left']:>8.1f}  ${m['volume_24h']:>9,.0f}  {fair:>5.2f}  {edge:>+6.2f}{flag}")
 
@@ -572,14 +738,15 @@ def print_signals(signals: list[dict], btc_price: float, bankroll: float):
         print("\n  No signals this cycle (no edge found above threshold).")
         return
 
-    print(f"\n  {'#':<3} {'STRATEGY':<25} {'TICKER':<35} {'RANGE':>22}  {'FAIR':>5}  {'MID':>5}  {'EDGE':>6}  {'CONTRACTS':>9}  {'LIMIT':>6}  {'MIN_LEFT':>8}")
-    print("  " + "-" * 145)
+    print(f"\n  {'#':<3} {'STRATEGY':<25} {'TICKER':<35} {'RANGE':>22}  {'FAIR':>5}  {'MID':>5}  {'NET_EDGE':>8}  {'CONTRACTS':>9}  {'LIMIT':>6}  {'MIN_LEFT':>8}")
+    print("  " + "-" * 150)
     for i, s in enumerate(signals, 1):
         cost = s["contracts"] * s["limit_price"]
+        raw_str = f"(raw {s.get('raw_edge', s['edge'])*100:.1f}pp)" if "raw_edge" in s else ""
         print(
             f"  {i:<3} {s['strategy']:<25} {s['ticker']:<35} {s['range']:>22}  "
-            f"{s['fair_value']:>5.2f}  {s['market_mid']:>5.2f}  {s['edge']:>+6.2f}  "
-            f"{s['contracts']:>9}  {s['limit_price']:>6.2f}  {s['minutes_to_close']:>8.1f}"
+            f"{s['fair_value']:>5.2f}  {s['market_mid']:>5.2f}  {s['edge']*100:>+7.1f}pp  "
+            f"{s['contracts']:>9}  {s['limit_price']:>6.2f}  {s['minutes_to_close']:>8.1f}  {raw_str}"
         )
         print(f"       --> BUY {s['contracts']}x {s['yes_no']} @ ${s['limit_price']:.2f}  (cost: ${cost:.2f} / bankroll: ${bankroll:.2f})")
 
@@ -589,23 +756,35 @@ def print_signals(signals: list[dict], btc_price: float, bankroll: float):
 # ---------------------------------------------------------------------------
 
 def main():
-    global BTC_HOURLY_VOL_PCT, MIN_EDGE_PCT, FRACTIONAL_KELLY, MAX_POSITION_PCT, TIME_DECAY_THRESHOLD_MIN, TIME_DECAY_MIN_FAIR
+    global BTC_HOURLY_VOL_PCT, MIN_EDGE_PCT, FRACTIONAL_KELLY, MAX_POSITION_PCT
+    global TIME_DECAY_THRESHOLD_MIN, TIME_DECAY_MIN_FAIR
+    global MIN_CONTRACT_PRICE, MIN_MINUTES_TO_EXPIRY, MAX_MINUTES_TO_EXPIRY
+    global MIN_NET_EDGE_PCT, SCAN_SPX
+
     _cfg = load_strategy_config()
     _avoid_hours = set()
     if _cfg:
         BTC_HOURLY_VOL_PCT = _cfg.get("btc_hourly_vol", BTC_HOURLY_VOL_PCT)
         _me = _cfg.get("min_edge_pp", None)
         if _me is not None:
-            MIN_EDGE_PCT = _me / 100.0  # config stores pp (8.0), code uses fraction (0.08)
+            MIN_EDGE_PCT = _me / 100.0
         FRACTIONAL_KELLY = _cfg.get("fractional_kelly", FRACTIONAL_KELLY)
         MAX_POSITION_PCT = _cfg.get("max_position_pct", MAX_POSITION_PCT)
         TIME_DECAY_THRESHOLD_MIN = _cfg.get("time_decay_threshold_min", TIME_DECAY_THRESHOLD_MIN)
         TIME_DECAY_MIN_FAIR = _cfg.get("time_decay_min_fair", TIME_DECAY_MIN_FAIR)
         _avoid_hours = set(_cfg.get("avoid_hours", []))
+        # New filter params
+        MIN_CONTRACT_PRICE    = _cfg.get("min_contract_price", MIN_CONTRACT_PRICE)
+        MIN_MINUTES_TO_EXPIRY = _cfg.get("min_minutes_to_expiry", MIN_MINUTES_TO_EXPIRY)
+        MAX_MINUTES_TO_EXPIRY = _cfg.get("max_minutes_to_expiry", MAX_MINUTES_TO_EXPIRY)
+        _net = _cfg.get("min_net_edge_pp", None)
+        if _net is not None:
+            MIN_NET_EDGE_PCT = _net / 100.0
+        SCAN_SPX = _cfg.get("scan_spx", SCAN_SPX)
         print(f"  [CONFIG] Loaded strategy_config.json (iteration {_cfg.get('iteration', '?')})")
         print(f"  [CONFIG] vol={BTC_HOURLY_VOL_PCT}, min_edge={MIN_EDGE_PCT}, kelly={FRACTIONAL_KELLY}")
+        print(f"  [CONFIG] longshot_floor={MIN_CONTRACT_PRICE}, expiry={MIN_MINUTES_TO_EXPIRY}-{MAX_MINUTES_TO_EXPIRY}min, scan_spx={SCAN_SPX}")
 
-    # Make _avoid_hours accessible at module level for generate_signals()
     globals()['_avoid_hours'] = _avoid_hours
 
     # File lock to prevent concurrent execution
@@ -635,12 +814,17 @@ def main():
     MIN_EDGE_PCT = args.min_edge
     BTC_HOURLY_VOL_PCT = args.vol
 
+    streak_mult = get_streak_multiplier()
+
     print("=" * 60)
     print("  KALSHI BTC RANGE MARKET TRADER")
     print(f"  Bankroll: ${args.bankroll:.2f}")
     print(f"  Poll interval: {args.interval}s")
-    print(f"  Min edge: {args.min_edge*100:.0f}pp")
+    print(f"  Min edge: {args.min_edge*100:.0f}pp | Min net edge: {MIN_NET_EDGE_PCT*100:.0f}pp")
+    print(f"  Longshot floor: ${MIN_CONTRACT_PRICE:.2f} | Expiry: {MIN_MINUTES_TO_EXPIRY}-{MAX_MINUTES_TO_EXPIRY}min")
     print(f"  BTC hourly vol: {args.vol*100:.1f}%")
+    print(f"  Streak multiplier: {streak_mult:.2f}x")
+    print(f"  SPX scanner: {'ON' if SCAN_SPX else 'OFF'}")
     print(f"  Signal log: {SIGNAL_LOG}")
     print("=" * 60)
 
@@ -665,6 +849,7 @@ def main():
             time.sleep(args.interval)
             continue
 
+        # --- BTC markets ---
         markets = get_btc_range_markets()
         if not markets:
             print("  No BTC range markets found — skipping cycle.")
@@ -675,6 +860,15 @@ def main():
         print_market_table(markets, btc_price)
 
         signals = generate_signals(markets, btc_price, args.bankroll)
+
+        # --- Change 4: SPX/Nasdaq markets ---
+        if SCAN_SPX:
+            spx_markets = get_spx_markets()
+            if spx_markets:
+                print(f"  SPX/Nasdaq markets found: {len(spx_markets)}")
+                spx_signals = generate_signals(spx_markets, btc_price, args.bankroll)
+                signals = sorted(signals + spx_signals, key=lambda x: x["edge"], reverse=True)
+
         print(f"\n  SIGNALS ({len(signals)} found):")
         print_signals(signals, btc_price, args.bankroll)
 
@@ -682,7 +876,6 @@ def main():
         recent_tickers = get_recent_tickers(cooldown_minutes=30)
         open_tickers = get_open_position_tickers()
 
-        # Log all signals and auto-trade eligible ones
         for s in signals:
             if args.auto_trade:
                 if s["ticker"] in recent_tickers:
@@ -710,7 +903,7 @@ def main():
             top = signals[0]
             print(f"  On Kalshi, search: {top['ticker']}")
             print(f"  Buy {top['contracts']}x {top['yes_no']} at ${top['limit_price']:.2f} limit")
-            print(f"  Cost: ${top['contracts'] * top['limit_price']:.2f}  |  Edge: {top['edge']*100:.1f}pp  |  Strategy: {top['strategy']}")
+            print(f"  Cost: ${top['contracts'] * top['limit_price']:.2f}  |  Net Edge: {top['edge']*100:.1f}pp  |  Strategy: {top['strategy']}")
 
         if args.once:
             print("\n  [--once] Single cycle complete. Exiting.")
