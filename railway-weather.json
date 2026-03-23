@@ -1,0 +1,14 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "_service": "weather-scanner",
+  "_note": "Deploy as a SECOND Railway service from the same repo. In Railway dashboard: New Service > GitHub Repo > set root to this repo > override Start Command below.",
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "deploy": {
+    "cronSchedule": "0 * * * *",
+    "startCommand": "python scripts/weather_trader.py --auto-trade",
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 3
+  }
+}
