@@ -1,5 +1,5 @@
 {
-  "min_edge_pp": 11.0,
+  "min_edge_pp": 12.0,
   "max_edge_pp": 15.0,
   "time_decay_threshold_min": 30,
   "time_decay_min_fair": 0.7,
@@ -7,9 +7,9 @@
   "last_mile_kelly": 0.4,
   "min_volume": 2000,
   "max_spread": 0.05,
-  "last_updated": "2026-03-23T00:00:00Z",
-  "iteration": 11,
-  "notes": "v11: widened expiry window 90->180min, min_minutes_to_expiry 30->15, enabled SPX, disabled MODEL_UNDERPRICED_NO (fees eating edge), fixed bankroll stale at $9.97",
+  "last_updated": "2026-03-24T02:05:20Z",
+  "iteration": 12,
+  "notes": "edge 11.0->12.0pp (win_rate 58.3% < break-even 65.1% -> edge +1pp); avoid_hours=[0] (poor-performing UTC hours (wr<40%, n>=3): [0]); top_failure=OVERCONFIDENT",
   "avoid_hours": [
     0
   ],
@@ -24,5 +24,6 @@
   "scan_economic": false,
   "scan_spx": true,
   "min_minutes_to_expiry": 15,
-  "max_minutes_to_expiry": 180
+  "max_minutes_to_expiry": 180,
+  "fractional_kelly": 0.25
 }
