@@ -1,9 +1,9 @@
 # Data files (large, regenerated from APIs)
 data/
-backtest/
-trades/
+backtest/*
+trades/*
 
-# Track critical config files even though parent dirs are ignored
+# Track critical config files
 !backtest/strategy_config.json
 !trades/bankroll.json
 
