@@ -3,6 +3,10 @@ data/
 backtest/
 trades/
 
+# Track critical config files even though parent dirs are ignored
+!backtest/strategy_config.json
+!trades/bankroll.json
+
 # Cursors / incremental state
 .polymarket_cursor.json
 .kalshi_cursor.json

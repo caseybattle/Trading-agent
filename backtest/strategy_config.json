@@ -1,0 +1,28 @@
+{
+  "min_edge_pp": 11.0,
+  "max_edge_pp": 15.0,
+  "time_decay_threshold_min": 30,
+  "time_decay_min_fair": 0.7,
+  "last_mile_enabled": true,
+  "last_mile_kelly": 0.4,
+  "min_volume": 2000,
+  "max_spread": 0.05,
+  "last_updated": "2026-03-23T00:00:00Z",
+  "iteration": 11,
+  "notes": "v11: widened expiry window 90->180min, min_minutes_to_expiry 30->15, enabled SPX, disabled MODEL_UNDERPRICED_NO (fees eating edge), fixed bankroll stale at $9.97",
+  "avoid_hours": [
+    0
+  ],
+  "disabled_strategies": [
+    "MODEL_UNDERPRICED_YES",
+    "MODEL_UNDERPRICED_NO"
+  ],
+  "btc_hourly_vol": 0.005,
+  "no_price_ceiling": 0.75,
+  "max_position_pct": 0.2,
+  "last_mile_min_distance": 50,
+  "scan_economic": false,
+  "scan_spx": true,
+  "min_minutes_to_expiry": 15,
+  "max_minutes_to_expiry": 180
+}
