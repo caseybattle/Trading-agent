@@ -1,0 +1,43 @@
+name: Kalshi BTC Active Monitor
+
+# Runs every 30 minutes between 11:00 AM and 9:59 PM EDT
+# EDT window: 11:00 AM–9:59 PM = 15:00–01:59 UTC
+# Cron covers 15:00–01:30 UTC (close enough; GitHub rounds to nearest :00 or :30)
+on:
+  schedule:
+    - cron: '0,30 15-23 * * *'   # 3:00 PM – 11:30 PM UTC (11 AM – 7:30 PM EDT)
+    - cron: '0,30 0,1  * * *'    # 12:00 AM – 1:30 AM UTC (8 PM – 9:30 PM EDT)
+  workflow_dispatch:
+
+jobs:
+  active-monitor:
+    name: Active Monitor
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run active monitor scan
+        env:
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
+          KALSHI_PRIVATE_KEY_CONTENTS: ${{ secrets.KALSHI_PRIVATE_KEY_CONTENTS }}
+          KALSHI_USE_DEMO: ${{ secrets.KALSHI_USE_DEMO || 'false' }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION || 'us-east-1' }}
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+          BANKROLL: ${{ secrets.BANKROLL || '10' }}
+        run: |
+          python scripts/kalshi_btc_trader.py \
+            --once \
+            --auto-trade \
+            --bankroll "$BANKROLL"
