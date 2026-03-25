@@ -68,6 +68,15 @@ def load_strategy_config() -> dict:
             return _storage.read_json("backtest/strategy_config.json")
     except Exception:
         pass
+    # Fallback: read local file directly (when storage_backend unavailable)
+    try:
+        import json
+        local_cfg = Path(__file__).resolve().parent.parent / "backtest" / "strategy_config.json"
+        if local_cfg.exists():
+            with open(local_cfg) as f:
+                return json.load(f)
+    except Exception:
+        pass
     return {}
 
 
@@ -464,15 +473,40 @@ def get_streak_multiplier() -> float:
 DAILY_LOSS_STOP_PCT = 0.03
 
 def check_daily_loss_stop() -> bool:
-    """Return True if daily loss exceeds 3% of starting bankroll."""
+    """Return True if TODAY's loss exceeds 3% of today's starting bankroll.
+
+    Uses daily_start_bankroll / daily_start_date fields in bankroll.json.
+    Resets automatically at UTC midnight.
+    """
     try:
         if _storage:
             state = _storage.read_json("trades/bankroll.json")
-            starting = state.get("starting_bankroll", 10.0)
-            current = state.get("current_bankroll", starting)
-            loss = starting - current
-            if loss >= starting * DAILY_LOSS_STOP_PCT:
-                return True
+        else:
+            import json
+            local_br = Path(__file__).resolve().parent.parent / "trades" / "bankroll.json"
+            with open(local_br) as f:
+                state = json.load(f)
+
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        current = float(state.get("current_bankroll", 10.0))
+
+        # Reset daily tracking if it's a new UTC day
+        if state.get("daily_start_date") != today_str:
+            state["daily_start_bankroll"] = current
+            state["daily_start_date"] = today_str
+            if _storage:
+                _storage.write_json("trades/bankroll.json", state)
+            else:
+                import json
+                local_br = Path(__file__).resolve().parent.parent / "trades" / "bankroll.json"
+                with open(local_br, "w") as f:
+                    json.dump(state, f, indent=2)
+            return False
+
+        daily_start = float(state.get("daily_start_bankroll", current))
+        daily_loss = daily_start - current
+        if daily_loss >= daily_start * DAILY_LOSS_STOP_PCT:
+            return True
     except Exception:
         pass
     return False

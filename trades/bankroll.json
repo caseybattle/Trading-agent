@@ -1,9 +1,11 @@
 {
   "starting_bankroll": 10.0,
-  "current_bankroll": 7.96,
-  "total_pnl": -2.01,
-  "total_pnl_pct": -20.16,
-  "last_updated": "2026-03-23T00:00:00Z",
+  "current_bankroll": 7.56,
+  "total_pnl": -2.44,
+  "total_pnl_pct": -24.4,
+  "last_updated": "2026-03-25T00:00:00Z",
+  "daily_start_bankroll": 7.56,
+  "daily_start_date": "2026-03-25",
   "source": "manual_update",
-  "note": "Manual sync to actual Kalshi balance. Bot was stale at $9.97 since 2026-03-19."
+  "note": "Manual sync to actual Kalshi balance as of 2026-03-25. Added daily loss tracking fields."
 }
