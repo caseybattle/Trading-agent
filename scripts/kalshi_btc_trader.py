@@ -638,7 +638,7 @@ def generate_signals(markets: list[dict], btc_price: float, bankroll: float,
                 })
 
         # --- Strategy 2: Model edge YES (overpriced probability) ---
-        elif edge_yes >= MIN_EDGE_PCT and fair > mid and minutes_left > 15:
+        elif fair > mid and minutes_left > 15:
             price = m["yes_ask"]
             # Change 1: longshot bias filter
             if price < MIN_CONTRACT_PRICE:
@@ -667,7 +667,7 @@ def generate_signals(markets: list[dict], btc_price: float, bankroll: float,
                 })
 
         # --- Strategy 3: Model edge NO (market thinks too likely, buy NO) ---
-        elif edge_no_clean >= MIN_EDGE_PCT and (1 - fair) > (1 - mid) and minutes_left > 15:
+        elif (1 - fair) > (1 - mid) and minutes_left > 15:
             # Change 1: longshot bias filter — apply to NO contract price
             if no_cost < MIN_CONTRACT_PRICE:
                 print(f"  [SKIP] {m['ticker']} LONGSHOT_BIAS_FILTER NO@{no_cost:.2f}")
