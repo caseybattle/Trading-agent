@@ -198,11 +198,14 @@ class S3Storage(StorageBackend):
 
 def get_storage() -> StorageBackend:
     """Factory function: return appropriate storage backend."""
-    if os.getenv('AWS_LAMBDA_FUNCTION_NAME'):
-        bucket = os.getenv('DATA_BUCKET')
-        if not bucket:
-            raise ValueError('DATA_BUCKET env var required in Lambda')
-        return S3Storage(bucket)
+    # AWS_S3_BUCKET triggers S3 mode (GitHub Actions, Railway, etc.)
+    # AWS_LAMBDA_FUNCTION_NAME triggers S3 mode (Lambda)
+    s3_bucket = (
+        os.getenv('AWS_S3_BUCKET')
+        or (os.getenv('DATA_BUCKET') if os.getenv('AWS_LAMBDA_FUNCTION_NAME') else None)
+    )
+    if s3_bucket:
+        return S3Storage(s3_bucket)
     else:
         # Local Windows/Linux
         project_root = os.getenv('PROJECT_ROOT')

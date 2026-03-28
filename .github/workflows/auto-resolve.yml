@@ -1,0 +1,37 @@
+name: KXBTC Auto Resolve
+
+# Runs every 30 minutes between 9:00 AM and 10:59 PM EDT
+# EDT window: 9:00 AM–10:59 PM = 13:00–02:59 UTC
+on:
+  schedule:
+    - cron: '0,30 13-23 * * *'   # 1:00 PM – 11:30 PM UTC (9 AM – 7:30 PM EDT)
+    - cron: '0,30 0,1,2  * * *'  # 12:00 AM – 2:30 AM UTC (8 PM – 10:30 PM EDT)
+  workflow_dispatch:
+
+jobs:
+  auto-resolve:
+    name: Auto Resolve Settled Trades
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Resolve settled trades and update P&L
+        env:
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
+          KALSHI_PRIVATE_KEY_CONTENTS: ${{ secrets.KALSHI_PRIVATE_KEY_CONTENTS }}
+          KALSHI_USE_DEMO: ${{ secrets.KALSHI_USE_DEMO || 'false' }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION || 'us-east-1' }}
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+        run: python scripts/auto_resolver.py

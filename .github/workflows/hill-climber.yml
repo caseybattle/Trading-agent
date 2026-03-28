@@ -1,0 +1,37 @@
+name: KXBTC Hill Climber Nightly
+
+# Runs nightly at 10:36 PM EDT (02:36 UTC)
+# Autoresearch-style parameter optimization after strategy optimizer completes
+on:
+  schedule:
+    - cron: '36 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  hill-climber:
+    name: Nightly Hill Climber Optimization
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run backtest parameter sweep
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION || 'us-east-1' }}
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+          BANKROLL: ${{ secrets.BANKROLL || '10' }}
+        run: |
+          python scripts/kxbtc_backtest.py \
+            --sweep \
+            --bankroll "$BANKROLL"
